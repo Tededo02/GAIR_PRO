@@ -231,3 +231,4 @@ data/point_clouds/
 visualize_superquadric.py
 data/
 data/results/
+validation/
