@@ -385,7 +385,7 @@ def gair_ransac(
             best_model,
             current_point_cloud,
             threshold,
-            factor=3.0,
+            factor=1.5,
             error_metric=consensus_metric,
             normals=None
         )

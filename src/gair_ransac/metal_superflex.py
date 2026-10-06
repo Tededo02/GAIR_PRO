@@ -3,6 +3,7 @@
 import numpy as np
 
 from .metal_superquadric import MetalBatchFitResult, fit_superquadric_metal_batch, metal_available
+from .superflex_bounds import extend_superflex_bounds
 
 
 class SuperflexMetalError(RuntimeError):
@@ -44,8 +45,7 @@ def superflex_optimization_bounds(reference_points, axis_penalty_weight):
     reference_model = pca_initialization(reference_points)
     support_box = axis_support_box(reference_points, reference_model, lower[0], loss_scale)
     upper[:3] = max(1e-2, 1.2 * diagonal)
-    lower = np.r_[lower, [-0.999, -0.999], np.full(6, -4.0)]
-    upper = np.r_[upper, [0.999, 0.999], np.full(6, 4.0)]
+    lower, upper = extend_superflex_bounds(lower, upper)
     return lower, upper, loss_scale, diagonal, support_box
 
 

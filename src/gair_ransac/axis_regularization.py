@@ -4,7 +4,7 @@ from src.superquadrics.superquadric_param import SuperQuadricParams
 from src.superquadrics.superquadric_residual import _rotation_matrix_and_derivatives
 
 
-DEFAULT_AXIS_PENALTY_WEIGHT = 0.1
+DEFAULT_AXIS_PENALTY_WEIGHT = 0.4
 
 
 def validate_axis_penalty_weight(weight: float) -> float:

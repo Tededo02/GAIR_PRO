@@ -41,9 +41,13 @@ three principal-axis initializations for tapering, and the previous model as
 the starting point for final refits. The stored `bending` array has shape `(3, 2)`
 and contains `(curvature, plane_angle)` rows in x, y, z order. The extended radial
 Jacobian's final six columns use Cartesian curvature components rather than
-curvature/angle coordinates. Tapering is bounded to `[-0.999, 0.999]` during fitting;
-curvature components are bounded to `[-4, 4]` after multiplication by the
-reference cloud's bounding-box diagonal.
+curvature/angle coordinates. Edit `SUPERFLEX_EXTRA_PARAMETER_BOUNDS` in
+`src/gair_ransac/superflex_bounds.py` to change the inclusive bounds for fit
+parameters 12 through 19. Parameters 12 and 13 (tapering) default to `[-0.25, 0.25]`.
+Parameters 14 through 19 (Cartesian bending components) default to `[-0.30, 0.30]`
+after multiplication by the reference cloud's bounding-box diagonal.
+The file labels every parameter separately. The same bounds apply to Metal
+hypotheses, axis initializations, final refits, and the explicit CPU reference.
 
 The shared Metal solver specializes to either 11 or 19 parameters. The complete
 optimization runs inside the kernel, including deformation inversion, residuals,

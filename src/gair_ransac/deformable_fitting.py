@@ -7,6 +7,7 @@ from src.superquadrics.superquadric_param import SuperQuadricParams
 from src.superquadrics.superquadric_residual import superquadric_radial_residual_and_jacobian
 from .axis_regularization import DEFAULT_AXIS_PENALTY_WEIGHT, axis_support_box, validate_axis_penalty_weight
 from .superflex_regularization import superflex_axis_penalty_residual_and_jacobian
+from .superflex_bounds import extend_superflex_bounds
 
 
 def _pack(model: SuperQuadricParams, length_scale: float) -> np.ndarray:
@@ -94,8 +95,7 @@ def _fit_deformable_cpu(points, bounds_reference_points, axis_penalty_weight, in
     support_box = axis_support_box(reference, reference_model, lower[0], loss_scale)
     # Axis identity changes across the three seeds; allow the existing global axis bound.
     upper[:3] = max(1e-2, 1.2 * diagonal)
-    lower = np.r_[lower, [-0.999, -0.999], np.full(6, -4.0)]
-    upper = np.r_[upper, [0.999, 0.999], np.full(6, 4.0)]
+    lower, upper = extend_superflex_bounds(lower, upper)
     if initial_model is not None:
         initial_model.validate()
         seeds = [initial_model]
