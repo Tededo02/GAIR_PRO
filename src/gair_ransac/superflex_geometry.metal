@@ -166,6 +166,45 @@ inline float sf_radial(float3 point, thread const float* p, float radial_eps, th
     return residual;
 }
 
+#define SF_COMPACTNESS_WEIGHT 0.01f
+#define SF_OVERSIZE_WEIGHT 0.1f
+
+template <bool with_jacobian>
+inline float sf_axis_penalty(int axis, thread const float* p, thread const float* box, float scale, thread float* jac) {
+    float cy = cos(p[5]), sy = sin(p[5]);
+    float cp = cos(p[6]), sp = sin(p[6]);
+    float cr = cos(p[7]), sr = sin(p[7]);
+    float3x3 rz(float3(cy, sy, 0), float3(-sy, cy, 0), float3(0, 0, 1));
+    float3x3 ry(float3(cp, 0, -sp), float3(0, 1, 0), float3(sp, 0, cp));
+    float3x3 rx(float3(1, 0, 0), float3(0, cr, sr), float3(0, -sr, cr));
+    float3x3 rotation = rz * ry * rx;
+    float3x3 support_box(float3(box[0], box[3], box[6]),
+                         float3(box[1], box[4], box[7]),
+                         float3(box[2], box[5], box[8]));
+    float3 projection = transpose(support_box) * rotation[axis];
+    float support = dot(abs(projection), float3(1));
+    float excess = max(p[axis] / support - 1.0f, 0.0f);
+    float radius_squared = 0.0f;
+    for (int j = 0; j < 9; ++j) radius_squared += box[j] * box[j];
+    float reference_radius = sqrt(radius_squared);
+    float size_ratio = p[axis] / reference_radius;
+    float size_squared = size_ratio * size_ratio;
+    float penalty = sqrt(excess * excess + SF_COMPACTNESS_WEIGHT * size_squared + SF_OVERSIZE_WEIGHT * size_squared * size_squared);
+    if (with_jacobian) {
+        for (int j = 0; j < 19; ++j) jac[j] = 0.0f;
+        float size_gradient = (SF_COMPACTNESS_WEIGHT * size_ratio + 2.0f * SF_OVERSIZE_WEIGHT * size_ratio * size_squared) / reference_radius;
+        jac[axis] = scale * (excess / support + size_gradient) / penalty;
+        float3x3 drz(float3(-sy, cy, 0), float3(-cy, -sy, 0), float3(0));
+        float3x3 dry(float3(-sp, 0, -cp), float3(0), float3(cp, 0, -sp));
+        float3x3 drx(float3(0), float3(0, -sr, cr), float3(0, -cr, -sr));
+        float factor = -scale * excess * p[axis] / (penalty * support * support);
+        jac[5] = factor * dot(sign(projection), transpose(support_box) * (drz * ry * rx)[axis]);
+        jac[6] = factor * dot(sign(projection), transpose(support_box) * (rz * dry * rx)[axis]);
+        jac[7] = factor * dot(sign(projection), transpose(support_box) * (rz * ry * drx)[axis]);
+    }
+    return scale * penalty;
+}
+
 template <int PARAMETERS, bool with_jacobian>
 inline float sq_model_radial(float3 point, thread const float* p, float radial_eps, thread float* jac) {
     if (PARAMETERS == 19) return sf_radial<with_jacobian>(point, p, radial_eps, jac);
@@ -174,7 +213,6 @@ inline float sq_model_radial(float3 point, thread const float* p, float radial_e
 
 template <int PARAMETERS, bool with_jacobian>
 inline float sq_model_axis_penalty(int axis, thread const float* p, thread const float* box, float scale, thread float* jac) {
-    float residual = sq_axis_penalty<with_jacobian>(axis, p, box, scale, jac);
-    if (with_jacobian) for (int j = 11; j < PARAMETERS; ++j) jac[j] = 0.0f;
-    return residual;
+    if (PARAMETERS == 19) return sf_axis_penalty<with_jacobian>(axis, p, box, scale, jac);
+    return sq_axis_penalty<with_jacobian>(axis, p, box, scale, jac);
 }

@@ -90,7 +90,7 @@ precision for small shapes at large world coordinates. This solver minimizes
 the same objective as SciPy's TRF solver, but its iterations and stopping criteria
 differ, so fitted parameters can differ.
 
-Fitting adds a quadratic penalty only for axes that exceed the support of the
+Rigid fitting adds a quadratic penalty only for axes that exceed the support of the
 reference points. A PCA bounding box supplies the directional half-span `s_j`;
 its half-spans include 10% slack plus twice the robust loss scale, and respect
 the existing minimum axis length. The box is projected into the current model
@@ -98,7 +98,7 @@ rotation, so supported elongated shapes and axis permutations remain valid.
 Inner hypotheses share the box of the full refined set rather than penalizing
 axes against each 40-point sample.
 
-The objective per fitted point is:
+The 11-parameter objective per fitted point is unchanged:
 
 ```text
 mean(soft_l1(radial_residual))
@@ -106,13 +106,43 @@ mean(soft_l1(radial_residual))
       * sum(max(a_j / s_j - 1, 0)**2)
 ```
 
-The axis term stays quadratic instead of being downweighted as an outlier.
+SuperFlex uses stronger regularization on its 19-parameter fits. Let
+`h_j = max(a_j / s_j - 1, 0)` and `q_j = a_j / R`, where `R` is the Frobenius
+norm of the reference support box (the diagonal half-span including its slack).
+Its objective is:
+
+```text
+mean(soft_l1(radial_residual))
+    + 0.5 * axis_penalty_weight * robust_loss_scale**2
+      * sum(h_j**2 + 0.01 * q_j**2 + 0.1 * q_j**4)
+```
+
+The mild continuous size term prefers smaller axes when enlarging them brings
+little fitting benefit, including axes inside the reference box. The added size
+costs use the overall reference radius and remain constant when the model rotates;
+this avoids adding a stronger directional constraint to bent shapes. Their
+relative weight is `SUPERFLEX_COMPACTNESS_WEIGHT=0.01` in
+`superflex_regularization.py` and the matching Metal constant. The existing
+excess-axis cost is retained and supplemented with `SUPERFLEX_OVERSIZE_WEIGHT=0.1`,
+giving quartic growth for very large axes. Axes remain relative to the reference
+point support, so the penalty is independent of world units.
+It is used for SuperFlex hypotheses, axis initializations, local optimization,
+and final refits; rigid warm starts retain the original 11-parameter penalty.
+
+The axis residuals retain ordinary squared loss instead of being downweighted as outliers.
 CPU and Metal use the same analytic derivatives, including rotation derivatives,
 and the weight is independent of sample count and Metal length normalization.
 `fit_superquadric_ls`, `inner_ransac`, and `gair_ransac` default to
 `axis_penalty_weight=0.1`. Setting it to zero restores the original fitting and
 disables the compact-axis tie preference. Direct low-level Metal fitting defaults to zero;
 positive weights require an `axis_support` box.
+
+For a stronger SuperFlex size preference, raise the existing scan setting
+`AXIS_PENALTY_WEIGHT` or override it for one run:
+
+```sh
+uv run main_scan_pc.py --model-family superflex --axis-penalty-weight 0.5
+```
 
 GAIR-RANSAC penalizes models that enclose other structures. For each original
 cloud point, radial penetration `d` gives the continuous interior strength

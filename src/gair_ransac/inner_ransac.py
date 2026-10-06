@@ -161,7 +161,7 @@ def fit_superquadric_ls(
 ) -> SuperQuadricParams:
     """Fit on Metal when available, or select the explicit 'metal'/'cpu' backend.
 
-    Metal and CPU share the radial soft_l1 objective and quadratic excess-axis penalty.
+    Metal and CPU share the radial soft_l1 objective and the selected family's axis penalty.
     PCA initialization and optimization bounds are prepared on the CPU.
     """
     validate_model_family(model_family)

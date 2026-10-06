@@ -20,7 +20,7 @@ PC_NAME = "car_pc_resized_100000.ply"
 
 
 ALGORITHM_NAME = "gair"
-MODEL_FAMILY = "rigid"  # Options: "rigid" (11 parameters), "superflex" (19 parameters).
+MODEL_FAMILY = "superflex"  # Options: "rigid" (11 parameters), "superflex" (19 parameters).
 ROOT = Path(__file__).resolve().parent
 PC_DIR = ROOT / "test_objects" / "real" 
 TEST_OBJECTS_DIR = ROOT / "test_objects"

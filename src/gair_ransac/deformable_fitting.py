@@ -5,7 +5,8 @@ import numpy as np
 from src.superquadrics.deformable_superquadric import DeformableSuperQuadricParams
 from src.superquadrics.superquadric_param import SuperQuadricParams
 from src.superquadrics.superquadric_residual import superquadric_radial_residual_and_jacobian
-from .axis_regularization import DEFAULT_AXIS_PENALTY_WEIGHT, axis_penalty_residual_and_jacobian, axis_support_box, validate_axis_penalty_weight
+from .axis_regularization import DEFAULT_AXIS_PENALTY_WEIGHT, axis_support_box, validate_axis_penalty_weight
+from .superflex_regularization import superflex_axis_penalty_residual_and_jacobian
 
 
 def _pack(model: SuperQuadricParams, length_scale: float) -> np.ndarray:
@@ -118,9 +119,9 @@ def _fit_deformable_cpu(points, bounds_reference_points, axis_penalty_weight, in
                 data, jacobian = superquadric_radial_residual_and_jacobian(model, points)
                 jacobian[:, 13:19] /= diagonal
                 if axis_penalty_weight > 0.0:
-                    penalty, penalty_jacobian = axis_penalty_residual_and_jacobian(parameters[:11], support_box, penalty_scale)
+                    penalty, penalty_jacobian = superflex_axis_penalty_residual_and_jacobian(parameters, support_box, penalty_scale)
                     data = np.r_[data, penalty]
-                    jacobian = np.vstack((jacobian, np.pad(penalty_jacobian, ((0, 0), (0, 8)))))
+                    jacobian = np.vstack((jacobian, penalty_jacobian))
                 cached_parameters = parameters.copy()
                 cached_residual, cached_jacobian = data, jacobian
             return cached_residual
