@@ -8,12 +8,14 @@ from scipy.spatial import cKDTree
 
 from src.gair_ransac.energy_strategies import FullGairEnergy, GcRansacEnergy
 from src.gair_ransac.gair_ransac import gair_ransac
+from src.gair_ransac.axis_regularization import DEFAULT_AXIS_PENALTY_WEIGHT
+from src.gair_ransac.interior_consensus import DEFAULT_INTERIOR_PENALTY_WEIGHT, validate_interior_penalty_weight
 from src.gair_ransac.normals_estimation import estimate_normals_open3d_consistent
 from src.superquadrics import superquadric_mesh as supmesh
 from src.visualizations import plot as vis
 
 
-PC_NAME = "etp_no_floor.ply"
+PC_NAME = "car_pc_resized_100000.ply"
 
 
 ALGORITHM_NAME = "gair"
@@ -25,15 +27,17 @@ K_NEIGHBORS = 90
 THRESHOLD = 0.010 # if 0 use point spacing to compute effective threshold
 THRESHOLD_SPACING_FACTOR = 2.0
 M_NEIGHBORS = 8
-MAX_MODELS = 12
+MAX_MODELS = 20
 MAX_ITERATIONS = 40
 INNER_ITERATIONS = 80
 SAMPLE_SIZE = 30
 MIN_INLIERS = 200
-MIN_COVERAGE = 0.3
+MIN_COVERAGE = 0.1
 MSS_MAX_POOL_FRACTION = 0.18
 RANDOM_SEED = 12345777
 MESH_SAMPLE_COUNT = 8000
+AXIS_PENALTY_WEIGHT = DEFAULT_AXIS_PENALTY_WEIGHT
+INTERIOR_PENALTY_WEIGHT = DEFAULT_INTERIOR_PENALTY_WEIGHT
 
 
 def resolve_input_path(input_file: str | Path) -> Path:
@@ -154,6 +158,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("input_file", nargs="?", default=PC_DIR / PC_NAME)
     parser.add_argument("--mesh-samples", type=int, default=MESH_SAMPLE_COUNT)
     parser.add_argument("--seed", type=int, default=RANDOM_SEED)
+    parser.add_argument("--axis-penalty-weight", type=float, default=AXIS_PENALTY_WEIGHT)
+    parser.add_argument("--interior-penalty-weight", type=float, default=INTERIOR_PENALTY_WEIGHT)
     return parser.parse_args(argv)
 
 
@@ -162,6 +168,9 @@ def main(argv: list[str] | None = None) -> int:
         argv = sys.argv[1:]
 
     args = parse_args(argv)
+    if not np.isfinite(args.axis_penalty_weight) or args.axis_penalty_weight < 0.0:
+        raise ValueError("axis_penalty_weight must be finite and non-negative")
+    validate_interior_penalty_weight(args.interior_penalty_weight)
     pc_path = resolve_input_path(args.input_file)
     if not pc_path.exists():
         raise FileNotFoundError("Point cloud not found")
@@ -195,6 +204,8 @@ def main(argv: list[str] | None = None) -> int:
         print("Running GAIR-RANSAC")
     else:
         print("Running GC-RANSAC")
+    print(f"Excess-axis penalty | weight={args.axis_penalty_weight:g}")
+    print(f"Coherent-interior penalty | weight={args.interior_penalty_weight:g}")
     models, inliers_masks, total_best_mss_used, total_local_opts = gair_ransac(
         threshold=effective_threshold,
         point_cloud=points,
@@ -209,6 +220,8 @@ def main(argv: list[str] | None = None) -> int:
         random_seed=args.seed,
         min_coverage=MIN_COVERAGE,
         energy_strategy=FullGairEnergy() if ALGORITHM_NAME == "gair" else GcRansacEnergy(),
+        axis_penalty_weight=args.axis_penalty_weight,
+        interior_penalty_weight=args.interior_penalty_weight,
     )
     if not models:
         raise RuntimeError("gair_ransac did not return any model")

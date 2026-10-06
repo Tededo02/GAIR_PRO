@@ -7,6 +7,11 @@ from .consensus import compute_consensus, expanded_removal_mask
 from .energy_strategies import FullGairEnergy, GairEnergyStrategy
 from .inner_ransac import inner_ransac, fit_superquadric_ls, InnerRansacResult
 from .metal_consensus import create_metal_consensus_context
+from .axis_regularization import DEFAULT_AXIS_PENALTY_WEIGHT, validate_axis_penalty_weight
+from .interior_consensus import (
+    DEFAULT_INTERIOR_PENALTY_WEIGHT, InteriorPenaltyContext, evaluate_model_consensus,
+    prefer_consensus_model, validate_interior_penalty_weight,
+)
 from .gair import gair
 from .initgraph import build_knn_graph
 from .mss import (
@@ -101,12 +106,19 @@ def gair_ransac(
     use_normal_coherence: bool | None = None,
     energy_strategy: GairEnergyStrategy | None = None,
     deadline: float | None = None,
+    axis_penalty_weight: float = DEFAULT_AXIS_PENALTY_WEIGHT,
+    interior_penalty_weight: float = DEFAULT_INTERIOR_PENALTY_WEIGHT,
 ) -> tuple[list[SuperQuadricParams], list[BoolArray], FloatArray | None, int]:
     """deadline: an absolute time.perf_counter() value. When set, the per-model iteration
     loop, the graph-cut local-optimization loop, and the inner_ransac refinement step all
     stop immediately once it passes, returning whatever best result was found so far.
     None (default) preserves normal, iteration-count-bounded behavior for run.py."""
     total_best_mss_used: FloatArray | None = None
+    axis_penalty_weight = validate_axis_penalty_weight(axis_penalty_weight)
+    interior_penalty_weight = validate_interior_penalty_weight(interior_penalty_weight)
+    score_enabled = interior_penalty_weight > 0.0
+    if score_enabled and (not np.isfinite(threshold) or threshold <= 0.0):
+        raise ValueError("interior scoring requires a finite, positive threshold")
     total_local_opts: int = 0
     if energy_strategy is None:
         energy_strategy = FullGairEnergy()
@@ -121,11 +133,22 @@ def gair_ransac(
     rng = np.random.default_rng(random_seed)
     n_points: int = point_cloud.shape[0]
     remaining_indices: IntArray = np.arange(n_points, dtype=np.int64)
-    _, full_edge = build_knn_graph(
+    full_neighbors, full_edge = build_knn_graph(
         point_cloud,
         m_neighbors=m_neighbors,
     )
     full_edge: IntArray = np.asarray(full_edge, dtype=np.int64)
+    interior_context = None
+    full_consensus_context = None
+    if score_enabled:
+        interior_context = InteriorPenaltyContext(
+            point_cloud, full_neighbors, interior_penalty_weight,
+            normals if use_normal_coherence else None,
+        )
+        full_consensus_context = create_metal_consensus_context(
+            point_cloud, normals if use_normal_coherence else None, consensus_metric,
+            interior_context=interior_context,
+        )
     models_set: list[SuperQuadricParams] = []
     inliers_set: list[BoolArray] = []
 
@@ -138,12 +161,19 @@ def gair_ransac(
         current_point_cloud: FloatArray = point_cloud[remaining_indices]
         V: FloatArray     = normals[remaining_indices]
         V_mss: FloatArray | None = mss_normals[remaining_indices] if mss_normals is not None else None
-        consensus_context = create_metal_consensus_context(
-            current_point_cloud, V if use_normal_coherence else None, consensus_metric,
-        )
+        if score_enabled:
+            interior_context.active_indices = remaining_indices
+            consensus_context = None if full_consensus_context is None else full_consensus_context.for_subset(
+                current_point_cloud, V if use_normal_coherence else None, remaining_indices,
+            )
+        else:
+            consensus_context = create_metal_consensus_context(
+                current_point_cloud, V if use_normal_coherence else None, consensus_metric,
+            )
 
         best_model: Optional[SuperQuadricParams] = None
         best_inliers: BoolArray = np.zeros(current_point_cloud.shape[0], dtype=bool)
+        best_score = 0.0
 
         edge: IntArray = _induced_subgraph_edges(full_edge, remaining_indices, n_points)
         best_mss_used: FloatArray | None = None
@@ -170,29 +200,27 @@ def gair_ransac(
                 dtype=np.float64,
             )
             try:
-                H_j: SuperQuadricParams = fit_superquadric_ls(M_j, error_metric=error_metric)
+                H_j: SuperQuadricParams = fit_superquadric_ls(
+                    M_j, error_metric=error_metric, axis_penalty_weight=axis_penalty_weight,
+                )
             except Exception:
                 continue
 
-            candidate_inliers: BoolArray = np.asarray(
-                compute_consensus(
-                    H_j,
-                    current_point_cloud,
-                    threshold,
-                    error_metric=consensus_metric,
-                    normals=V if use_normal_coherence else None,
-                    metal_context=consensus_context,
-                ),
-                dtype=bool,
+            candidate_inliers, candidate_count, candidate_score, _ = evaluate_model_consensus(
+                H_j, current_point_cloud, threshold, consensus_metric, V if use_normal_coherence else None,
+                consensus_context, interior_context, compute_consensus,
             )
-            candidate_count: int = int(np.count_nonzero(candidate_inliers))
             best_count: int     = int(np.count_nonzero(best_inliers))
-            if candidate_count < best_count + 1:
+            if not prefer_consensus_model(
+                H_j, candidate_count, candidate_score, best_model, best_count, best_score,
+                axis_penalty_weight, score_enabled,
+            ):
                 continue
 
             current_model:   SuperQuadricParams = H_j
             current_inliers: BoolArray          = candidate_inliers.copy()
             current_count:   int                = candidate_count
+            current_score:   float              = candidate_score
             terminate:       bool               = False
             local_iteration: int                = 0
 
@@ -232,25 +260,43 @@ def gair_ransac(
                     random_seed=int(rng.integers(0, np.iinfo(np.int32).max)),
                     deadline=deadline,
                     consensus_context=consensus_context,
+                    axis_penalty_weight=axis_penalty_weight,
+                    interior_context=interior_context,
+                    min_inliers=min_inliers if score_enabled else 0,
                 )
-                if inner_result.best_inlier_count <= 0:
+                if inner_result.best_inlier_count <= 0 or (score_enabled and inner_result.best_inlier_count < min_inliers):
                     terminate = True
                     continue
 
                 # Update using inner-RANSAC consensus (c_hat): more stable than using
                 # the GAIR-refined set directly, which is the strict paper variant.
                 new_inliers: BoolArray = np.asarray(inner_result.best_inliers_mask, dtype=bool)
-                if compare_consensus(current_inliers, new_inliers, min_gain=min_gain):
+                new_score = inner_result.best_score
+                if new_score is None:
+                    new_score = float(inner_result.best_inlier_count) if not score_enabled else interior_context.score(
+                        inner_result.best_model, inner_result.best_inlier_count, threshold,
+                    )[0]
+                if prefer_consensus_model(
+                    inner_result.best_model, inner_result.best_inlier_count, new_score,
+                    current_model, current_count, current_score,
+                    axis_penalty_weight, score_enabled, min_gain,
+                ):
                     current_inliers = new_inliers
                     current_count   = int(np.count_nonzero(new_inliers))
                     current_model   = inner_result.best_model
+                    current_score   = new_score
                 else:
                     terminate = True
 
-            if current_count > int(np.count_nonzero(best_inliers)):
+            if (not score_enabled or current_count >= min_inliers) and prefer_consensus_model(
+                current_model, current_count, current_score,
+                best_model, int(np.count_nonzero(best_inliers)), best_score,
+                axis_penalty_weight, score_enabled,
+            ):
                 best_model    = current_model
                 best_inliers  = current_inliers
                 best_mss_used = M_j.copy()
+                best_score = current_score
 
         if best_model is None:
             break
@@ -266,23 +312,20 @@ def gair_ransac(
                     best_points,
                     error_metric=error_metric,
                     bounds_reference_points=best_points,
+                    axis_penalty_weight=axis_penalty_weight,
                 )
-                refit_inliers = np.asarray(
-                    compute_consensus(
-                        refit_model,
-                        current_point_cloud,
-                        threshold,
-                        error_metric=consensus_metric,
-                        normals=V if use_normal_coherence else None,
-                        metal_context=consensus_context,
-                    ),
-                    dtype=bool,
+                refit_inliers, refit_count, refit_score, _ = evaluate_model_consensus(
+                    refit_model, current_point_cloud, threshold, consensus_metric, V if use_normal_coherence else None,
+                    consensus_context, interior_context, compute_consensus,
                 )
-                refit_count = int(np.count_nonzero(refit_inliers))
-                if refit_count >= best_count:
+                if refit_count >= min_inliers and (prefer_consensus_model(
+                    refit_model, refit_count, refit_score,
+                    best_model, best_count, best_score, axis_penalty_weight, score_enabled,
+                ) or (not score_enabled and axis_penalty_weight == 0.0 and refit_count == best_count)):
                     best_model   = refit_model
                     best_inliers = refit_inliers
                     best_count   = refit_count
+                    best_score   = refit_score
             except Exception:
                 pass
 

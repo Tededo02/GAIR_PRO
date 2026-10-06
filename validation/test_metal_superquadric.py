@@ -79,7 +79,7 @@ class BackendTests(unittest.TestCase):
         support = surface_points(SuperQuadricParams(1.2, 0.8, 0.5, 0.8, 1.2), count=100)
         sampled_batches = []
 
-        def fake_batch(points, initial, *args):
+        def fake_batch(points, initial, *args, **kwargs):
             sampled_batches.append(points.copy())
             return MetalBatchFitResult(initial, np.tile([1, 1, 0], (len(points), 1)))
 
@@ -107,7 +107,7 @@ class BackendTests(unittest.TestCase):
         clock = [0.0]
         parameters = np.array([1.2, 0.8, 0.5, 1, 1, 0, 0, 0, 0, 0, 0])
 
-        def fake_batch(points, *args):
+        def fake_batch(points, *args, **kwargs):
             clock[0] = 2.0
             return MetalBatchFitResult(np.tile(parameters, (len(points), 1)), np.tile([1, 1, 0], (len(points), 1)))
 

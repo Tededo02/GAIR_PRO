@@ -23,14 +23,31 @@ if (point_index < point_count) {
     float3 ratios = abs(pc / axes);
     float pxy = 2.0f / e2, pz = 2.0f / e1, k = e2 / e1;
     float log_u = sq_logadd(pxy*log(ratios.x), pxy*log(ratios.y));
-    float log_shape = max(sq_logadd(k*log_u, pz*log(ratios.z)), log(1e-12f));
-    float radius = max(length(pc), options[2]);
+    float raw_log_shape = sq_logadd(k*log_u, pz*log(ratios.z));
+    float log_shape = max(raw_log_shape, log(1e-12f));
+    float raw_radius = length(pc);
+    float radius = max(raw_radius, options[2]);
     float surface_radius = radius * exp(-0.5f * e1 * log_shape);
     float error = abs(radius - surface_radius);
     float threshold = options[0];
+    bool is_active = true;
+    if (SCORE_INTERIOR) {
+        is_active = active[point_index] != 0;
+        float depth = 0.0f;
+        if (raw_radius <= options[2]) {
+            depth = min(axes.x, min(axes.y, axes.z)) * exp2(-0.5f*(max(e1-1.0f, 0.0f)+max(e2-1.0f, 0.0f)));
+        } else if (raw_log_shape < 0.0f) {
+            depth = raw_log_shape == log_shape ? surface_radius - raw_radius
+                : exp(log(raw_radius) - 0.5f*e1*raw_log_shape) - raw_radius;
+        }
+        float excess = max(depth-threshold, 0.0f);
+        float denominator = max(excess, threshold);
+        float x = excess / denominator, y = threshold / denominator;
+        interior[candidate*point_count+point_index] = x*x / (x*x+y*y);
+    }
     float distance_margin = 128.0f * FLT_EPSILON * max(1.0f, radius + surface_radius);
-    uncertain = isfinite(threshold) && abs(error-threshold) <= distance_margin;
-    bool accepted = error < threshold;
+    uncertain = is_active && isfinite(threshold) && abs(error-threshold) <= distance_margin;
+    bool accepted = is_active && error < threshold;
 
     if (HAS_NORMALS && accepted && !uncertain) {
         float3 observed(normals[3*point_index], normals[3*point_index+1], normals[3*point_index+2]);

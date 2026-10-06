@@ -8,6 +8,13 @@ from .consensus import compute_consensus
 from .metal_superquadric import fit_superquadric_metal, fit_superquadric_metal_batch, metal_available
 from .metal_consensus import MetalConsensusContext, create_metal_consensus_context
 from src.superquadrics.superquadric_residual import superquadric_radial_residual_and_jacobian
+from .axis_regularization import (
+    DEFAULT_AXIS_PENALTY_WEIGHT, axis_penalty_residual_and_jacobian,
+    axis_support_box, validate_axis_penalty_weight,
+)
+from .interior_consensus import (
+    InteriorPenaltyContext, evaluate_model_consensus, prefer_consensus_model,
+)
 
 
 ROBUST_LOSS_SCALE_FACTOR = 0.02
@@ -21,6 +28,8 @@ class InnerRansacResult:
     best_model: SuperQuadricParams
     best_inlier_count: int
     best_inliers_mask: np.ndarray
+    best_score: float | None = None
+    interior_mass: float = 0.0
 
 def pca_initialization(points: np.ndarray) -> SuperQuadricParams:
     parameters = _pca_initial_parameters(np.asarray(points, dtype=np.float64)[None, :, :])[0]
@@ -138,13 +147,15 @@ def fit_superquadric_ls(
     error_metric: str = "radial",
     bounds_reference_points: np.ndarray | None = None,
     backend: str = "auto",
+    axis_penalty_weight: float = DEFAULT_AXIS_PENALTY_WEIGHT,
 ) -> SuperQuadricParams:
     """Fit on Metal when available, or select the explicit 'metal'/'cpu' backend.
 
-    Metal runs bounded, damped Gauss-Newton with the same radial soft_l1 objective.
+    Metal and CPU share the radial soft_l1 objective and quadratic excess-axis penalty.
     PCA initialization and optimization bounds are prepared on the CPU.
     """
     del error_metric
+    axis_penalty_weight = validate_axis_penalty_weight(axis_penalty_weight)
     if backend not in {"auto", "metal", "cpu"}:
         raise ValueError("backend must be 'auto', 'metal' or 'cpu'")
     point_array = np.asarray(points, dtype=np.float64)
@@ -158,6 +169,9 @@ def fit_superquadric_ls(
     reference_points = point_array if bounds_reference_points is None else np.asarray(bounds_reference_points, dtype=np.float64)
     reference_model = _model_from_parameters(initial_parameters) if bounds_reference_points is None else None
     lower_bounds, upper_bounds, robust_loss_scale, reference_diagonal = _optimization_bounds(reference_points, reference_model)
+    if reference_model is None:
+        reference_model = pca_initialization(reference_points)
+    support_box = axis_support_box(reference_points, reference_model, lower_bounds[0], robust_loss_scale)
     np.clip(initial_parameters, lower_bounds, upper_bounds, out=initial_parameters)
 
     if backend == "metal" or (backend == "auto" and metal_available()):
@@ -168,6 +182,8 @@ def fit_superquadric_ls(
             upper_bounds,
             robust_loss_scale,
             reference_diagonal,
+            axis_penalty_weight=axis_penalty_weight,
+            axis_support=support_box,
         )
         return _model_from_parameters(parameters)
 
@@ -189,6 +205,14 @@ def fit_superquadric_ls(
                 current_model,
                 point_array,
             )
+            if axis_penalty_weight > 0.0:
+                # Scale by sqrt(N) so regularization has the same strength for MSS and full refits.
+                penalty, penalty_jacobian = axis_penalty_residual_and_jacobian(
+                    parameters, support_box,
+                    np.sqrt(len(point_array) * axis_penalty_weight) * robust_loss_scale,
+                )
+                residuals = np.concatenate((residuals, penalty))
+                jacobian = np.vstack((jacobian, penalty_jacobian))
             radial_cache["parameters"] = np.array(parameters, dtype=np.float64, copy=True)
             radial_cache["residuals"] = residuals
             radial_cache["jacobian"] = jacobian
@@ -198,13 +222,22 @@ def fit_superquadric_ls(
         radial_residuals(parameters)
         return radial_cache["jacobian"]
 
+    def regularized_loss(z: np.ndarray) -> np.ndarray:
+        # Keep soft_l1 on data residuals and a quadratic loss on the three axis residuals.
+        root = np.sqrt(1.0 + z)
+        rho = np.vstack((2.0 * z / (root + 1.0), 1.0 / root, -0.5 / root**3))
+        rho[0, -3:] = z[-3:]
+        rho[1, -3:] = 1.0
+        rho[2, -3:] = 0.0
+        return rho
+
     optimization_result = least_squares(
         fun=radial_residuals,
         jac=radial_jacobian,
         x0=initial_parameters,
         method="trf",
         bounds=(lower_bounds, upper_bounds),
-        loss="soft_l1",
+        loss=regularized_loss if axis_penalty_weight > 0.0 else "soft_l1",
         f_scale=robust_loss_scale,
         max_nfev=1000,
     )
@@ -236,6 +269,9 @@ def inner_ransac(
     random_seed: int | None = None,
     deadline: float | None = None,
     consensus_context: MetalConsensusContext | None = None,
+    axis_penalty_weight: float = DEFAULT_AXIS_PENALTY_WEIGHT,
+    interior_context: InteriorPenaltyContext | None = None,
+    min_inliers: int = 0,
 ) -> InnerRansacResult:
     """Fit and score independent 40-point hypotheses in batches of up to 80.
 
@@ -243,6 +279,10 @@ def inner_ransac(
     and launching each batch. In-flight GPU fitting and consensus dispatches
     finish before returning the best result found so far.
     """
+    axis_penalty_weight = validate_axis_penalty_weight(axis_penalty_weight)
+    if interior_context is None and consensus_context is not None:
+        interior_context = consensus_context.interior_context
+    score_enabled = interior_context is not None and interior_context.weight > 0.0
     point_cloud = np.asarray(point_cloud, dtype=np.float64)
     refined_set_index = np.asarray(refined_set_index, dtype=np.int64)
     actual_set_index = None if actual_set_index is None else np.asarray(actual_set_index, dtype=np.int64)
@@ -258,6 +298,8 @@ def inner_ransac(
     best_model: Optional[SuperQuadricParams] = None
     best_inliers: np.ndarray = np.zeros(actual_points.shape[0], dtype=bool)
     best_count: int = -1
+    best_score: float = -1.0
+    best_mass: float = 0.0
     if consensus_metric is None:
         consensus_metric = error_metric
     if refined_set_index.size == 0 or actual_points.shape[0] == 0:
@@ -271,35 +313,66 @@ def inner_ransac(
         if consensus_metric != "radial":
             raise ValueError("Metal consensus supports the radial residual metric")
         consensus_context.check_inputs(actual_points, actual_normals)
+        if score_enabled and consensus_context.interior_context is not interior_context:
+            raise ValueError("Metal consensus must share the requested original-cloud interior context")
     for candidate_models in _inner_candidate_model_batches(
         point_cloud, refined_set_index, bounds_reference_points,
         size_sample, n_iters, rng, error_metric, deadline,
+        axis_penalty_weight,
     ):
         if not candidate_models:
             continue
         if consensus_context is None and metal_available():
-            consensus_context = create_metal_consensus_context(actual_points, actual_normals, consensus_metric)
+            active_indices = None
+            if score_enabled:
+                active_indices = interior_context.active_indices
+                if actual_set_index is not None:
+                    active_indices = active_indices[actual_set_index]
+            consensus_context = create_metal_consensus_context(
+                actual_points, actual_normals, consensus_metric,
+                interior_context=interior_context if score_enabled else None, active_indices=active_indices,
+            )
         # Keep the first completed candidate when a fitting dispatch overruns the deadline.
         if deadline is not None and time.perf_counter() >= deadline:
             candidate_models = candidate_models[:1]
         if consensus_context is not None:
             consensus = consensus_context.evaluate(candidate_models, threshold)
-            winner = consensus.best_index
+            eligible = np.flatnonzero(consensus.counts >= min_inliers)
+            if not len(eligible):
+                continue
+            winner = int(eligible[0])
+            for index in eligible[1:]:
+                if prefer_consensus_model(
+                    candidate_models[index], int(consensus.counts[index]), float(consensus.scores[index]),
+                    candidate_models[winner], int(consensus.counts[winner]), float(consensus.scores[winner]),
+                    axis_penalty_weight, score_enabled,
+                ):
+                    winner = int(index)
             candidate_count = int(consensus.counts[winner])
-            if candidate_count > best_count:
+            candidate_score = float(consensus.scores[winner])
+            if prefer_consensus_model(
+                candidate_models[winner], candidate_count, candidate_score,
+                best_model, best_count, best_score, axis_penalty_weight, score_enabled,
+            ):
                 best_model = candidate_models[winner]
                 best_count = candidate_count
+                best_score = candidate_score
+                best_mass = 0.0 if consensus.interior_masses is None else float(consensus.interior_masses[winner])
                 best_inliers = consensus.mask(winner)
         else:
             for candidate_model in candidate_models:
-                candidate_inlier_mask = compute_consensus(
-                    candidate_model, actual_points, threshold,
-                    error_metric=consensus_metric, normals=actual_normals,
+                candidate_inlier_mask, candidate_count, candidate_score, candidate_mass = evaluate_model_consensus(
+                    candidate_model, actual_points, threshold, consensus_metric, actual_normals,
+                    None, interior_context, compute_consensus,
                 )
-                candidate_count = int(np.count_nonzero(candidate_inlier_mask))
-                if candidate_count > best_count:
+                if candidate_count >= min_inliers and prefer_consensus_model(
+                    candidate_model, candidate_count, candidate_score,
+                    best_model, best_count, best_score, axis_penalty_weight, score_enabled,
+                ):
                     best_model = candidate_model
                     best_count = candidate_count
+                    best_score = candidate_score
+                    best_mass = candidate_mass
                     best_inliers = candidate_inlier_mask.astype(bool, copy=False)
                 if deadline is not None and time.perf_counter() >= deadline:
                     break
@@ -319,23 +392,28 @@ def inner_ransac(
                 inlier_points,
                 error_metric=error_metric,
                 bounds_reference_points=inlier_points,
+                axis_penalty_weight=axis_penalty_weight,
             )
-            refined_inlier_mask = compute_consensus(
-                refined_model,
-                actual_points,
-                threshold,
-                error_metric=consensus_metric,
-                normals=actual_normals,
-                metal_context=consensus_context,
+            refined_inlier_mask, refined_inlier_count, refined_score, refined_mass = evaluate_model_consensus(
+                refined_model, actual_points, threshold, consensus_metric, actual_normals,
+                consensus_context, interior_context, compute_consensus,
             )
-            refined_inlier_count = int(np.count_nonzero(refined_inlier_mask))
-            if refined_inlier_count >= best_count:
+            if refined_inlier_count >= min_inliers and (prefer_consensus_model(
+                refined_model, refined_inlier_count, refined_score,
+                best_model, best_count, best_score, axis_penalty_weight, score_enabled,
+            ) or (
+                not score_enabled and axis_penalty_weight == 0.0 and refined_inlier_count == best_count
+            )):
                 best_model = refined_model
                 best_count = refined_inlier_count
+                best_score = refined_score
+                best_mass = refined_mass
                 best_inliers = refined_inlier_mask.astype(bool, copy=False)
         except Exception:
             pass
-    return InnerRansacResult(best_model=best_model, best_inlier_count=best_count, best_inliers_mask=best_inliers)
+    return InnerRansacResult(
+        best_model, best_count, best_inliers, best_score, best_mass,
+    )
 
 
 def _inner_candidate_models(
@@ -347,11 +425,12 @@ def _inner_candidate_models(
     rng: np.random.Generator,
     error_metric: str,
     deadline: float | None,
+    axis_penalty_weight: float = DEFAULT_AXIS_PENALTY_WEIGHT,
 ) -> Iterator[SuperQuadricParams]:
     # Preserve the individual-candidate iterator for callers and validation tools.
     for models in _inner_candidate_model_batches(
         point_cloud, refined_set_index, bounds_reference_points, size_sample,
-        n_iters, rng, error_metric, deadline,
+        n_iters, rng, error_metric, deadline, axis_penalty_weight,
     ):
         for model in models:
             yield model
@@ -368,6 +447,7 @@ def _inner_candidate_model_batches(
     rng: np.random.Generator,
     error_metric: str,
     deadline: float | None,
+    axis_penalty_weight: float = DEFAULT_AXIS_PENALTY_WEIGHT,
 ) -> Iterator[list[SuperQuadricParams]]:
     if n_iters <= 0 or size_sample < 11:
         return
@@ -383,6 +463,7 @@ def _inner_candidate_model_batches(
                 model = fit_superquadric_ls(
                     point_cloud[sample_idx], error_metric=error_metric,
                     bounds_reference_points=bounds_reference_points, backend="cpu",
+                    axis_penalty_weight=axis_penalty_weight,
                 )
             except Exception:
                 continue
@@ -391,7 +472,9 @@ def _inner_candidate_model_batches(
 
     try:
         # All samples use the same support bounds; compute them once for the whole search.
-        lower, upper, loss_scale, diagonal = _optimization_bounds(bounds_reference_points)
+        reference_model = pca_initialization(bounds_reference_points)
+        lower, upper, loss_scale, diagonal = _optimization_bounds(bounds_reference_points, reference_model)
+        support_box = axis_support_box(bounds_reference_points, reference_model, lower[0], loss_scale)
     except Exception:
         return
     for start in range(0, n_iters, INNER_RANSAC_BATCH_SIZE):
@@ -409,6 +492,7 @@ def _inner_candidate_model_batches(
                 return
             result = fit_superquadric_metal_batch(
                 sampled_points, initial_parameters, lower, upper, loss_scale, diagonal,
+                axis_penalty_weight=axis_penalty_weight, axis_support=support_box,
             )
         except Exception:
             continue

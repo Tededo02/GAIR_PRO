@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.gair_ransac.consensus import compute_consensus, distance_err, normal_alignment_score
 from src.gair_ransac.metal_consensus import MetalConsensusContext
+from src.gair_ransac.interior_consensus import InteriorPenaltyContext, consensus_scores
 from src.gair_ransac.metal_superquadric import metal_available
 from src.superquadrics.superquadric_param import SuperQuadricParams
 from src.superquadrics.superquadric_residual import superquadric_normal_world
@@ -71,6 +72,89 @@ def benchmark_consensus():
     }), flush=True)
 
 
+def benchmark_interior_consensus():
+    target = SuperQuadricParams(1.2, 0.8, 0.5, 0.8, 1.2, [0.4, -0.3, 0.2], [3, -2, 1])
+    points = surface_points(target, count=55966)
+    normals = superquadric_normal_world(target, points)
+    rng = np.random.default_rng(42)
+    points += rng.normal(0, 0.02, points.shape)
+    points[::3] = target.t + 0.6*(points[::3]-target.t)
+    models = [SuperQuadricParams(target.a1, target.a2, target.a3, target.e1, target.e2, target.rot,
+                               target.t + rng.normal(0, 0.05, 3)) for _ in range(80)]
+    interior = InteriorPenaltyContext(points, normals=normals)
+    legacy = MetalConsensusContext(points, normals)
+    weighted = MetalConsensusContext(points, normals, interior)
+
+    def gpu(context):
+        result = context.evaluate(models, 0.01)
+        result.mask(result.best_index)
+        return result
+
+    counts = np.array([compute_consensus(model, points, 0.01, normals=normals).sum() for model in models])
+    masses = np.array([interior.mass(model, 0.01) for model in models])
+    result = gpu(weighted)
+    np.testing.assert_array_equal(result.counts, counts)
+    np.testing.assert_allclose(result.interior_masses, masses, rtol=5e-5, atol=1e-3)
+    np.testing.assert_allclose(result.scores, consensus_scores(counts, masses, interior.weight), rtol=5e-5)
+    legacy_ms = median_ms(lambda: gpu(legacy), repeats=9)
+    weighted_ms = median_ms(lambda: gpu(weighted), repeats=9)
+    print(json.dumps({
+        "benchmark": "80-model Metal consensus with coherent interior scoring and winner mask transfer",
+        "points": len(points), "models": len(models), "legacy_metal_ms": legacy_ms,
+        "interior_metal_ms": weighted_ms, "extra_ms": weighted_ms-legacy_ms,
+        "cpu_metal_counts_identical": True, "cpu_metal_scores_match": True,
+    }), flush=True)
+
+
+def benchmark_main_scan_interior(input_file=None):
+    import main_scan_pc as main
+    path = main.resolve_input_path(input_file if input_file is not None else main.PC_DIR / main.PC_NAME)
+    start = perf_counter()
+    points, _, normals = main.load_point_cloud(path, main.MESH_SAMPLE_COUNT, main.RANDOM_SEED)
+    threshold, _ = main.compute_effective_threshold(points)
+    if normals is None:
+        normals = main.estimate_normals_open3d_consistent(points, main.K_NEIGHBORS)
+    print(json.dumps({"input": str(path), "points": len(points), "threshold": threshold,
+                      "preprocessing_seconds": perf_counter()-start}), flush=True)
+    interior = InteriorPenaltyContext(points, weight=main.INTERIOR_PENALTY_WEIGHT)
+
+    def run(weight, warmup=False):
+        return main.gair_ransac(
+            points, normals=normals, threshold=threshold, max_models=1 if warmup else main.MAX_MODELS,
+            m_neighbors=main.M_NEIGHBORS, max_iterations=1 if warmup else main.MAX_ITERATIONS,
+            sample_size=main.SAMPLE_SIZE, min_inliers=main.MIN_INLIERS,
+            inner_iterations=1 if warmup else main.INNER_ITERATIONS, use_normal_coherence=True,
+            random_seed=main.RANDOM_SEED, min_coverage=main.MIN_COVERAGE,
+            energy_strategy=main.FullGairEnergy() if main.ALGORITHM_NAME == "gair" else main.GcRansacEnergy(),
+            axis_penalty_weight=main.AXIS_PENALTY_WEIGHT, interior_penalty_weight=weight,
+        )
+
+    for weight in (0.0, main.INTERIOR_PENALTY_WEIGHT):
+        run(weight, warmup=True)
+    timings = {0.0: [], main.INTERIOR_PENALTY_WEIGHT: []}
+    for weight in (0.0, main.INTERIOR_PENALTY_WEIGHT, main.INTERIOR_PENALTY_WEIGHT, 0.0):
+        print(f"Running main_scan_pc settings with interior_penalty_weight={weight}", flush=True)
+        start = perf_counter()
+        models, masks, _, local_opts = run(weight)
+        elapsed = perf_counter()-start
+        timings[weight].append(elapsed)
+        union = main.combine_inlier_masks(masks)
+        covered = int(union.sum()) if union is not None else 0
+        masses = [interior.mass(model, threshold) for model in models]
+        counts = [int(mask.sum()) for mask in masks]
+        print(json.dumps({
+            "weight": weight, "seconds": elapsed, "models": len(models), "inliers": covered,
+            "coverage": covered/len(points), "local_optimizations": local_opts,
+            "interior_mass": sum(masses), "interior_mass_per_inlier": sum(masses)/max(sum(counts), 1),
+            "model_details": [{"inliers": count, "interior_mass": mass, "ratio": mass/max(count, 1)}
+                              for count, mass in zip(counts, masses)],
+        }), flush=True)
+        if not models:
+            raise AssertionError("The complete GAIR pipeline returned no model")
+    print(json.dumps({"benchmark": "main_scan_pc interior penalty, visualization and normals excluded",
+                      "median_seconds": {str(weight): float(np.median(times)) for weight, times in timings.items()}}), flush=True)
+
+
 def benchmark_main_scan():
     import main_scan_pc as main
     gr = importlib.import_module("src.gair_ransac.gair_ransac")
@@ -91,6 +175,7 @@ def benchmark_main_scan():
             inner_iterations=main.INNER_ITERATIONS, use_normal_coherence=True,
             random_seed=main.RANDOM_SEED, min_coverage=main.MIN_COVERAGE,
             energy_strategy=main.FullGairEnergy() if main.ALGORITHM_NAME == "gair" else main.GcRansacEnergy(),
+            interior_penalty_weight=0.0,
         )
 
     # The reference keeps the same Metal fitter, sampling, seeds, and GAIR energy.
@@ -126,12 +211,19 @@ def benchmark_main_scan():
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--main-scan", action="store_true", help="Also compare the complete algorithm with main_scan_pc settings")
+    parser.add_argument("--interior", action="store_true", help="Compare disabled/enabled coherent interior scoring on Metal")
+    parser.add_argument("--input", help="Scan path for the interior end-to-end comparison")
     args = parser.parse_args()
     if not metal_available():
         raise RuntimeError("An accessible Apple silicon Metal GPU and MLX are required")
-    benchmark_consensus()
-    if args.main_scan:
-        benchmark_main_scan()
+    if args.interior:
+        benchmark_interior_consensus()
+        if args.main_scan:
+            benchmark_main_scan_interior(args.input)
+    else:
+        benchmark_consensus()
+        if args.main_scan:
+            benchmark_main_scan()
 
 
 if __name__ == "__main__":

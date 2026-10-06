@@ -75,3 +75,40 @@ inline float sq_soft_l1(float residual, float loss_scale) {
     float ratio = residual / loss_scale;
     return residual * residual / (sqrt(1.0f + ratio * ratio) + 1.0f);
 }
+
+template <bool with_jacobian>
+inline float sq_axis_penalty(
+    int axis,
+    thread const float* p,
+    thread const float* box,
+    float residual_scale,
+    thread float* jac
+) {
+    float cy = cos(p[5]), sy = sin(p[5]);
+    float cp = cos(p[6]), sp = sin(p[6]);
+    float cr = cos(p[7]), sr = sin(p[7]);
+    float3x3 rz(float3(cy, sy, 0), float3(-sy, cy, 0), float3(0, 0, 1));
+    float3x3 ry(float3(cp, 0, -sp), float3(0, 1, 0), float3(sp, 0, cp));
+    float3x3 rx(float3(1, 0, 0), float3(0, cr, sr), float3(0, -sr, cr));
+    float3x3 rotation = rz * ry * rx;
+    float3x3 support_box(float3(box[0], box[3], box[6]),
+                         float3(box[1], box[4], box[7]),
+                         float3(box[2], box[5], box[8]));
+    float3 projection = transpose(support_box) * rotation[axis];
+    float support = dot(abs(projection), float3(1));
+    float excess = max(p[axis] / support - 1.0f, 0.0f);
+    if (with_jacobian) {
+        for (int j = 0; j < 11; ++j) jac[j] = 0.0f;
+        if (excess > 0.0f) {
+            jac[axis] = residual_scale / support;
+            float3x3 drz(float3(-sy, cy, 0), float3(-cy, -sy, 0), float3(0));
+            float3x3 dry(float3(-sp, 0, -cp), float3(0), float3(cp, 0, -sp));
+            float3x3 drx(float3(0), float3(0, -sr, cr), float3(0, -cr, -sr));
+            float factor = -residual_scale * p[axis] / (support * support);
+            jac[5] = factor * dot(sign(projection), transpose(support_box) * (drz * ry * rx)[axis]);
+            jac[6] = factor * dot(sign(projection), transpose(support_box) * (rz * dry * rx)[axis]);
+            jac[7] = factor * dot(sign(projection), transpose(support_box) * (rz * ry * drx)[axis]);
+        }
+    }
+    return residual_scale * excess;
+}

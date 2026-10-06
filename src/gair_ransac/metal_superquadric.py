@@ -43,7 +43,7 @@ def _fit_kernel():
     directory = Path(__file__).parent
     return mx.fast.metal_kernel(
         name="superquadric_bounded_soft_l1_batch_fit",
-        input_names=["points", "initial", "bounds", "options"],
+        input_names=["points", "initial", "bounds", "options", "axis_support"],
         output_names=["fitted", "diagnostics"],
         header=(directory / "superquadric_fit_helpers.metal").read_text(),
         source=(directory / "superquadric_fit.metal").read_text(),
@@ -58,6 +58,8 @@ def fit_superquadric_metal_batch(
     robust_loss_scale: float | np.ndarray,
     length_scale: float | np.ndarray,
     max_nfev: int | np.ndarray = 1000,
+    axis_penalty_weight: float | np.ndarray = 0.0,
+    axis_support: np.ndarray | None = None,
 ) -> MetalBatchFitResult:
     """Optimize independent (B, N, 3) samples in one Metal dispatch.
 
@@ -76,12 +78,22 @@ def fit_superquadric_metal_batch(
     scales = np.broadcast_to(np.asarray(length_scale, dtype=np.float64), (batch_size,)).copy()
     loss_scales = np.broadcast_to(np.asarray(robust_loss_scale, dtype=np.float64), (batch_size,))
     limits = np.broadcast_to(np.asarray(max_nfev, dtype=np.float64), (batch_size,))
+    penalty_weights = np.broadcast_to(np.asarray(axis_penalty_weight, dtype=np.float64), (batch_size,))
     if not np.isfinite(scales).all() or np.any(scales <= 0):
         raise ValueError("length_scale must be finite and positive")
     if not np.isfinite(loss_scales).all() or np.any(loss_scales <= 0):
         raise ValueError("robust_loss_scale must be finite and positive")
     if not np.isfinite(limits).all() or np.any(limits < 1) or np.any(limits != np.floor(limits)):
         raise ValueError("max_nfev must contain positive integers")
+    if not np.isfinite(penalty_weights).all() or np.any(penalty_weights < 0):
+        raise ValueError("axis_penalty_weight must be finite and non-negative")
+    if axis_support is None:
+        if np.any(penalty_weights > 0):
+            raise ValueError("axis_support is required when axis_penalty_weight is positive")
+        axis_support = np.eye(3)
+    support_boxes = np.broadcast_to(np.asarray(axis_support, dtype=np.float64), (batch_size, 3, 3))
+    if not np.isfinite(support_boxes).all() or np.any(np.linalg.det(support_boxes) == 0.0):
+        raise ValueError("axis_support must contain finite, nonsingular (3, 3) support boxes")
     lower_bounds = np.broadcast_to(np.asarray(lower_bounds, dtype=np.float64), (batch_size, 11))
     upper_bounds = np.broadcast_to(np.asarray(upper_bounds, dtype=np.float64), (batch_size, 11))
 
@@ -98,7 +110,7 @@ def fit_superquadric_metal_batch(
 
     # Forty-point samples use two complete SIMD groups; each fit owns its threadgroup state.
     threads = 32 if point_count <= 32 else 64
-    options = np.column_stack((loss_scales / scales, 1e-12 / scales, limits)).astype(np.float32)
+    options = np.column_stack((loss_scales / scales, 1e-12 / scales, limits, penalty_weights)).astype(np.float32)
     mx = _metal_runtime()
     if mx is None:
         raise RuntimeError("Metal fitting requires Apple silicon, an accessible GPU and MLX; run uv sync")
@@ -109,6 +121,7 @@ def fit_superquadric_metal_batch(
             mx.array(normalized_initial.astype(np.float32)),
             mx.array(np.concatenate((normalized_lower, normalized_upper), axis=1).astype(np.float32)),
             mx.array(options),
+            mx.array((support_boxes / scales[:, None, None]).astype(np.float32)),
         ],
         template=[("THREADS", threads)],
         grid=(threads, batch_size, 1),
@@ -132,6 +145,8 @@ def fit_superquadric_metal(
     robust_loss_scale: float,
     length_scale: float,
     max_nfev: int = 1000,
+    axis_penalty_weight: float = 0.0,
+    axis_support: np.ndarray | None = None,
 ) -> np.ndarray:
     result = fit_superquadric_metal_batch(
         np.asarray(points)[None, :, :],
@@ -141,6 +156,8 @@ def fit_superquadric_metal(
         robust_loss_scale,
         length_scale,
         max_nfev,
+        axis_penalty_weight=axis_penalty_weight,
+        axis_support=axis_support,
     )
     status, evaluations, _ = result.diagnostics[0]
     if not result.success[0]:

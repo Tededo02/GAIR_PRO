@@ -15,6 +15,280 @@ from src.gair_ransac.metal_superquadric import metal_available
 from src.superquadrics.superquadric_param import SuperQuadricParams
 from src.superquadrics.superquadric_residual import superquadric_normal_world
 from test_metal_superquadric import surface_points
+from src.gair_ransac.interior_consensus import (
+    InteriorPenaltyContext, consensus_scores, interior_strength,
+)
+
+
+def enclosed_structure_scene():
+    angles = np.linspace(0, 2*np.pi, 128, endpoint=False)
+    ring = np.column_stack((np.cos(angles), np.sin(angles), np.zeros_like(angles)))
+    angles = angles[:16]
+    cap = np.column_stack((0.1*np.cos(angles), 0.1*np.sin(angles), np.full(16, 2*np.sqrt(0.99))))
+    nested = SuperQuadricParams(0.05, 0.05, 0.05, 1, 1, t=[0, 0, 0.8])
+    points = np.vstack((ring, cap, surface_points(nested, count=48)))
+    large = SuperQuadricParams(1, 1, 2, 1, 1)
+    small = SuperQuadricParams(1, 1, 0.2, 1, 1)
+    return points, large, small, nested
+
+
+class InteriorConsensusTests(unittest.TestCase):
+    def test_strength_is_smooth_bounded_and_zero_in_the_surface_band(self):
+        model = SuperQuadricParams(1, 1, 1, 1, 1)
+        radii = np.array([1.1, 1, 0.995, 0.99, 0.99-1e-6, 0.98, 0.9, 0])
+        points = np.column_stack((radii, np.zeros((len(radii), 2))))
+        strength = interior_strength(model, points, 0.01)
+        np.testing.assert_allclose(strength[:4], 0, atol=1e-25)
+        self.assertGreater(strength[4], 0)
+        self.assertLess(strength[4], 1e-7)
+        self.assertAlmostEqual(strength[5], 0.5)
+        self.assertTrue(np.all(np.diff(strength) >= -1e-25))
+        self.assertLess(strength[-1], 1)
+        self.assertGreater(strength[-1], 0.999)
+
+    def test_coherent_cluster_has_more_mass_than_an_isolated_point(self):
+        model = SuperQuadricParams(1, 1, 1, 1, 1)
+        shell = surface_points(model, count=400)
+        isolated = InteriorPenaltyContext(np.vstack((shell, [[0, 0, 0]])))
+        cluster = np.random.default_rng(2).normal(0, 0.03, (48, 3))
+        coherent = InteriorPenaltyContext(np.vstack((shell, cluster)))
+        self.assertAlmostEqual(isolated.mass(model, 0.01), 0)
+        self.assertGreater(coherent.mass(model, 0.01), 47)
+        self.assertLessEqual(coherent.mass(model, 0.01), 48)
+
+    def test_penalty_is_relative_and_has_no_count_cutoff(self):
+        masses = np.array([0, 10, 100, 300, 1000], dtype=float)
+        scores = consensus_scores(1000, masses, 25)
+        np.testing.assert_allclose(scores, [1000, 997.5062344, 800, 307.6923077, 38.46153846])
+        np.testing.assert_allclose(consensus_scores(10000, masses*10, 25), scores*10)
+        np.testing.assert_array_equal(consensus_scores([10, 100], [1000, 1000], 0), [10, 100])
+
+    def test_scale_rotation_translation_and_extreme_exponents(self):
+        for e1, e2 in ((0.06, 0.06), (0.06, 4.5), (4.5, 0.06), (4.5, 4.5)):
+            model = SuperQuadricParams(1.2, 0.8, 0.5, e1, e2)
+            surface = surface_points(model, count=200)
+            points = np.vstack((surface, surface*0.8, surface*0.1, [[0, 0, 0]]))
+            strength = interior_strength(model, points, 0.01)
+            transformed = SuperQuadricParams(0.012, 0.008, 0.005, e1, e2, [0.4, -0.3, 0.2], [1e6, -2e6, 3e6])
+            moved = 0.01*points @ transformed.rotation_matrix().T + transformed.t
+            # World-coordinate float64 quantization affects sharp shapes close to their canonical axes.
+            np.testing.assert_allclose(interior_strength(transformed, moved, 1e-4), strength, atol=5e-4)
+            self.assertTrue(np.isfinite(strength).all())
+            self.assertTrue(np.all((strength >= 0) & (strength <= 1)))
+
+    def test_cpu_inner_prefers_fewer_inliers_and_rejects_enclosing_refit(self):
+        points, large, small, _ = enclosed_structure_scene()
+        context = InteriorPenaltyContext(points)
+        with patch("src.gair_ransac.inner_ransac._inner_candidate_model_batches", return_value=iter([[large, small]])):
+            with patch("src.gair_ransac.inner_ransac.metal_available", return_value=False):
+                with patch("src.gair_ransac.inner_ransac.fit_superquadric_ls", return_value=large):
+                    result = inner_ransac(points, np.arange(len(points)), None, 0.01, interior_context=context, axis_penalty_weight=0)
+        self.assertIs(result.best_model, small)
+        self.assertEqual(result.best_inlier_count, 128)
+        self.assertAlmostEqual(result.best_score, 128)
+        self.assertGreater(compute_consensus(large, points, 0.01).sum(), result.best_inlier_count)
+
+    def test_outer_selection_and_final_refit_use_score_and_zero_restores_counts(self):
+        gr = importlib.import_module("src.gair_ransac.gair_ransac")
+        points, large, small, _ = enclosed_structure_scene()
+        for weight, expected in ((25, small), (0, large)):
+            with self.subTest(weight=weight):
+                with patch.object(gr, "create_metal_consensus_context", return_value=None):
+                    with patch.object(gr, "fit_superquadric_ls", side_effect=[large, small, large]):
+                        with patch.object(gr, "gair", return_value=np.zeros(len(points), dtype=bool)):
+                            models, masks, _, _ = gr.gair_ransac(
+                                points, threshold=0.01, max_iterations=2, sample_size=20,
+                                min_inliers=20, random_seed=7, axis_penalty_weight=0, interior_penalty_weight=weight,
+                            )
+            self.assertIs(models[0], expected)
+            self.assertEqual(masks[0].sum(), 128 if weight else 144)
+
+    def test_local_optimization_accepts_smaller_support_when_score_improves(self):
+        gr = importlib.import_module("src.gair_ransac.gair_ransac")
+        points, large, small, _ = enclosed_structure_scene()
+        mask = compute_consensus(small, points, 0.01)
+        result = gr.InnerRansacResult(small, int(mask.sum()), mask)
+        with patch.object(gr, "create_metal_consensus_context", return_value=None):
+            with patch.object(gr, "fit_superquadric_ls", return_value=large):
+                with patch.object(gr, "gair", return_value=np.ones(len(points), dtype=bool)):
+                    with patch.object(gr, "inner_ransac", return_value=result) as refinements:
+                        models, masks, _, _ = gr.gair_ransac(
+                            points, threshold=0.01, max_iterations=1, sample_size=20,
+                            min_inliers=20, random_seed=7, axis_penalty_weight=0,
+                        )
+        self.assertIs(models[0], small)
+        self.assertEqual(masks[0].sum(), 128)
+        self.assertEqual(refinements.call_count, 2)
+
+    def test_already_extracted_structure_still_penalizes_later_models(self):
+        gr = importlib.import_module("src.gair_ransac.gair_ransac")
+        points, large, small, nested = enclosed_structure_scene()
+        with patch.object(gr, "create_metal_consensus_context", return_value=None):
+            with patch.object(gr, "fit_superquadric_ls", side_effect=[nested, nested, nested, large, small, large]):
+                with patch.object(gr, "gair", return_value=np.zeros(len(points), dtype=bool)):
+                    models, masks, _, _ = gr.gair_ransac(
+                        points, threshold=0.01, max_iterations=2, max_models=2,
+                        sample_size=20, min_inliers=20, random_seed=7, axis_penalty_weight=0,
+                    )
+        self.assertEqual(len(models), 2)
+        self.assertIs(models[0], nested)
+        self.assertIs(models[1], small)
+        self.assertEqual(masks[0].sum(), 48)
+        self.assertEqual(masks[1].sum(), 128)
+
+    def test_invalid_weights_and_thresholds_fail_before_fitting(self):
+        gr = importlib.import_module("src.gair_ransac.gair_ransac")
+        points, _, _, _ = enclosed_structure_scene()
+        for weight in (-1, float("nan"), float("inf")):
+            with self.assertRaisesRegex(ValueError, "interior_penalty_weight"):
+                gr.gair_ransac(points, interior_penalty_weight=weight)
+        for threshold in (0, -1, float("nan"), float("inf")):
+            with self.assertRaisesRegex(ValueError, "threshold"):
+                gr.gair_ransac(points, threshold=threshold)
+
+    def test_inner_keeps_minimum_support_requirement_when_scoring(self):
+        points, large, _, nested = enclosed_structure_scene()
+        interior = InteriorPenaltyContext(points)
+        with patch("src.gair_ransac.inner_ransac._inner_candidate_model_batches", return_value=iter([[large, nested]])):
+            with patch("src.gair_ransac.inner_ransac.metal_available", return_value=False):
+                with patch("src.gair_ransac.inner_ransac.fit_superquadric_ls", return_value=nested):
+                    result = inner_ransac(points, np.arange(len(points)), None, 0.01, interior_context=interior,
+                                          axis_penalty_weight=0, min_inliers=100)
+        self.assertIs(result.best_model, large)
+        self.assertEqual(result.best_inlier_count, 144)
+
+    def test_ragged_graph_and_points_without_neighbors_have_finite_mass(self):
+        model = SuperQuadricParams(1, 1, 1, 1, 1)
+        points = np.array([[0, 0, 0], [0.1, 0, 0], [1, 0, 0]], dtype=float)
+        interior = InteriorPenaltyContext(points, neighbors=[[1, 2], [0], []])
+        strength = interior_strength(model, points, 0.01)
+        expected = strength[0]*strength[1]/2 + strength[1]*strength[0]
+        self.assertAlmostEqual(interior.mass(model, 0.01), expected)
+        isolated = InteriorPenaltyContext(points, neighbors=[[], [], []])
+        self.assertAlmostEqual(isolated.mass(model, 0.01), strength.sum())
+
+
+@unittest.skipUnless(metal_available(), "An accessible Apple silicon Metal GPU and MLX are required")
+class MetalInteriorConsensusTests(unittest.TestCase):
+    def test_graph_with_no_neighbors_and_empty_inputs(self):
+        model = SuperQuadricParams(1, 1, 1, 1, 1)
+        points = np.array([[0, 0, 0], [0.1, 0, 0], [1, 0, 0]], dtype=float)
+        interior = InteriorPenaltyContext(points, neighbors=[[], [], []])
+        context = MetalConsensusContext(points, interior_context=interior)
+        result = context.evaluate([model], 0.01)
+        self.assertAlmostEqual(result.interior_masses[0], interior.mass(model, 0.01), places=5)
+        empty = MetalConsensusContext(np.empty((0, 3)), interior_context=InteriorPenaltyContext(np.empty((0, 3))))
+        result = empty.evaluate([model], 0.01)
+        np.testing.assert_array_equal(result.scores, [0])
+        np.testing.assert_array_equal(result.interior_masses, [0])
+        self.assertEqual(result.mask(0).shape, (0,))
+        self.assertEqual(context.evaluate([], 0.01).scores.shape, (0,))
+
+    def test_inner_minimum_support_filters_batch_and_refit(self):
+        points, large, _, nested = enclosed_structure_scene()
+        interior = InteriorPenaltyContext(points)
+        context = MetalConsensusContext(points, interior_context=interior)
+        with patch("src.gair_ransac.inner_ransac._inner_candidate_model_batches", return_value=iter([[large, nested]])):
+            with patch("src.gair_ransac.inner_ransac.fit_superquadric_ls", return_value=nested):
+                result = inner_ransac(points, np.arange(len(points)), None, 0.01, consensus_context=context,
+                                      axis_penalty_weight=0, min_inliers=100)
+        self.assertIs(result.best_model, large)
+        self.assertEqual(result.best_inlier_count, 144)
+
+    def test_two_extractions_reuse_gpu_reference_and_penalize_removed_structure(self):
+        gr = importlib.import_module("src.gair_ransac.gair_ransac")
+        points, large, small, nested = enclosed_structure_scene()
+        with patch.object(gr, "create_metal_consensus_context", wraps=create_metal_consensus_context) as contexts:
+            with patch.object(gr, "fit_superquadric_ls", side_effect=[nested, nested, nested, large, small, large]):
+                with patch.object(gr, "gair", return_value=np.zeros(len(points), dtype=bool)):
+                    models, masks, _, _ = gr.gair_ransac(
+                        points, threshold=0.01, max_iterations=2, max_models=2,
+                        sample_size=20, min_inliers=20, random_seed=7, axis_penalty_weight=0,
+                    )
+        self.assertEqual(contexts.call_count, 1)
+        self.assertEqual(len(models), 2)
+        self.assertIs(models[0], nested)
+        self.assertIs(models[1], small)
+        self.assertEqual(masks[0].sum(), 48)
+        self.assertEqual(masks[1].sum(), 128)
+
+    def test_80_model_scores_and_winner_match_cpu(self):
+        points, large, small, _ = enclosed_structure_scene()
+        interior = InteriorPenaltyContext(points)
+        context = MetalConsensusContext(points, interior_context=interior)
+        models = [large, small]*40
+        result = context.evaluate(models, 0.01)
+        expected_counts = [compute_consensus(model, points, 0.01).sum() for model in models]
+        expected_mass = [interior.mass(model, 0.01) for model in models]
+        np.testing.assert_array_equal(result.counts, expected_counts)
+        np.testing.assert_allclose(result.interior_masses, expected_mass, rtol=2e-5, atol=1e-5)
+        np.testing.assert_allclose(result.scores, consensus_scores(expected_counts, expected_mass, 25), rtol=2e-5)
+        self.assertEqual(result.best_index, 1)
+        np.testing.assert_array_equal(result.mask(result.best_index), compute_consensus(small, points, 0.01))
+
+    def test_subset_reuses_original_gpu_buffers_and_keeps_removed_points_in_mass(self):
+        points, large, small, _ = enclosed_structure_scene()
+        interior = InteriorPenaltyContext(points)
+        full = MetalConsensusContext(points, interior_context=interior)
+        indices = np.arange(143, -1, -1)
+        active = points[indices]
+        context = full.for_subset(active, None, indices)
+        context.check_inputs(active, None)
+        self.assertIs(context._gpu_points, full._gpu_points)
+        self.assertIs(context._gpu_neighbors, full._gpu_neighbors)
+        result = context.evaluate([large, small], 0.01)
+        self.assertGreater(result.interior_masses[0], 47)
+        self.assertEqual(result.best_index, 1)
+        for i, model in enumerate([large, small]):
+            np.testing.assert_array_equal(result.mask(i), compute_consensus(model, active, 0.01))
+
+    def test_subset_boundary_corrections_map_back_to_active_indices(self):
+        model = SuperQuadricParams(1, 1, 1, 1, 1)
+        radii = 1.01 + np.array([-1e-10, 1e-10, 0, -1e-7])
+        points = np.vstack((np.column_stack((radii, np.zeros((4, 2)))), [[0, 0, 0], [0.1, 0, 0]]))
+        interior = InteriorPenaltyContext(points)
+        full = MetalConsensusContext(points, interior_context=interior)
+        indices = np.array([3, 1, 0])
+        active = points[indices]
+        context = full.for_subset(active, None, indices)
+        result = context.evaluate([model], 0.01)
+        self.assertTrue(result._corrections)
+        np.testing.assert_array_equal(result.mask(0), compute_consensus(model, active, 0.01))
+        self.assertEqual(result.counts[0], result.mask(0).sum())
+
+    def test_extreme_exponents_center_translation_and_scale_match_cpu(self):
+        for e1, e2 in ((0.06, 0.06), (0.06, 4.5), (4.5, 0.06), (4.5, 4.5)):
+            for factor, translation in ((1.0, [0, 0, 0]), (0.01, [1e6, -2e6, 3e6])):
+                with self.subTest(e1=e1, e2=e2, factor=factor):
+                    model = SuperQuadricParams(1.2*factor, 0.8*factor, 0.5*factor, e1, e2, [0.4, -0.3, 0.2], translation)
+                    surface = surface_points(model, count=261)
+                    points = np.vstack((surface, model.t+0.8*(surface-model.t), model.t+0.1*(surface-model.t), model.t[None]))
+                    interior = InteriorPenaltyContext(points)
+                    result = MetalConsensusContext(points, interior_context=interior).evaluate([model], 0.01*factor)
+                    np.testing.assert_allclose(result.interior_masses[0], interior.mass(model, 0.01*factor), rtol=5e-5, atol=1e-4)
+                    np.testing.assert_array_equal(result.mask(0), compute_consensus(model, points, 0.01*factor))
+
+    def test_inner_penalty_uses_batch_scores_and_downloads_only_winner(self):
+        points, large, small, _ = enclosed_structure_scene()
+        interior = InteriorPenaltyContext(points)
+        context = MetalConsensusContext(points, interior_context=interior)
+        with patch("src.gair_ransac.inner_ransac._inner_candidate_model_batches", return_value=iter([[large, small]*40])):
+            with patch("src.gair_ransac.inner_ransac.fit_superquadric_ls", return_value=large):
+                with patch.object(MetalConsensusResult, "mask", autospec=True, side_effect=MetalConsensusResult.mask) as masks:
+                    result = inner_ransac(points, np.arange(len(points)), None, 0.01, consensus_context=context, axis_penalty_weight=0)
+        self.assertIs(result.best_model, small)
+        self.assertEqual(result.best_inlier_count, 128)
+        self.assertEqual(masks.call_count, 2)
+        self.assertEqual(masks.call_args_list[0].args[1], 1)
+
+    def test_zero_weight_retains_legacy_kernel_and_exact_selection(self):
+        points, large, small, _ = enclosed_structure_scene()
+        context = MetalConsensusContext(points, interior_context=InteriorPenaltyContext(points, weight=0))
+        result = context.evaluate([large, small], 0.01)
+        self.assertIsNone(context.interior_context)
+        self.assertIsNone(result.interior_masses)
+        np.testing.assert_array_equal(result.scores, result.counts)
+        self.assertEqual(result.best_index, 0)
 
 
 class CpuConsensusTests(unittest.TestCase):

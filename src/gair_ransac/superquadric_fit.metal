@@ -9,8 +9,12 @@ threadgroup float partials[THREADS / 32][78];
 threadgroup float current_cost, damping, growth, predicted, step_norm;
 threadgroup int status, evaluations, accepted;
 float count = float(point_count);
-float loss_scale = options[3 * fit_index], radial_eps = options[3 * fit_index + 1];
-int max_evaluations = int(options[3 * fit_index + 2]);
+float loss_scale = options[4 * fit_index], radial_eps = options[4 * fit_index + 1];
+int max_evaluations = int(options[4 * fit_index + 2]);
+float penalty_weight = options[4 * fit_index + 3];
+float penalty_scale = loss_scale * sqrt(penalty_weight);
+float support_box[9];
+for (int j = 0; j < 9; ++j) support_box[j] = axis_support[9 * fit_index + j];
 if (lane < 11) {
     parameters[lane] = initial[11 * fit_index + lane];
     lower[lane] = bounds[22 * fit_index + lane];
@@ -69,6 +73,17 @@ while (evaluations < max_evaluations && status == 0) {
                 hessian[11*j+k] = value;
                 hessian[11*k+j] = value;
                 index += 1;
+            }
+        }
+        if (penalty_weight > 0.0f) {
+            for (int axis = 0; axis < 3; ++axis) {
+                float jac[11];
+                float residual = sq_axis_penalty<true>(axis, local_p, support_box, penalty_scale, jac);
+                current_cost += 0.5f * residual * residual;
+                for (int j = 0; j < 11; ++j) {
+                    gradient[j] += jac[j] * residual;
+                    for (int k = 0; k < 11; ++k) hessian[11*j+k] += jac[j] * jac[k];
+                }
             }
         }
         evaluations += 1;
@@ -148,6 +163,13 @@ while (evaluations < max_evaluations && status == 0) {
         if (lane == 0 && status == 0) {
             float trial_cost = 0.0f;
             for (int group = 0; group < THREADS / 32; ++group) trial_cost += partials[group][0] / count;
+            if (penalty_weight > 0.0f) {
+                for (int axis = 0; axis < 3; ++axis) {
+                    float unused[11];
+                    float residual = sq_axis_penalty<false>(axis, local_p, support_box, penalty_scale, unused);
+                    trial_cost += 0.5f * residual * residual;
+                }
+            }
             evaluations += 1;
             float reduction = current_cost - trial_cost;
             float gain = predicted > 0.0f ? reduction / predicted : -1.0f;
