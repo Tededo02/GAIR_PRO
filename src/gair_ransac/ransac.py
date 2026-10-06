@@ -3,9 +3,11 @@ import time
 import numpy as np
 
 from src.superquadrics.superquadric_param import SuperQuadricParams
+from src.superquadrics.model_family import parameter_count, validate_model_family
 from .consensus import compute_consensus, expanded_removal_mask
 from .inner_ransac import inner_ransac, fit_superquadric_ls, InnerRansacResult
 from .metal_consensus import create_metal_consensus_context
+from .metal_superflex import SuperflexMetalError
 from numpy.typing import NDArray
 
 FloatArray = NDArray[np.float64]
@@ -30,11 +32,15 @@ def ransac(
     random_seed: int | None = None,
     local_optimization: bool = True,
     deadline: float | None = None,
-) -> tuple[list[SuperQuadricParams], list[BoolArray]]:
+    model_family: str = "rigid",
+) -> tuple[list[SuperQuadricParams], list[BoolArray], int]:
     """deadline: an absolute time.perf_counter() value. When set, both the per-model
     iteration loop and the inner_ransac local-optimization step stop immediately once it
     passes, returning whatever best result was found so far. None (default) preserves
     normal, iteration-count-bounded behavior for run.py."""
+    validate_model_family(model_family)
+    if sample_size < parameter_count(model_family):
+        raise ValueError(f"sample_size must be at least {parameter_count(model_family)} for {model_family}")
     point_cloud: FloatArray = np.asarray(point_cloud, dtype=np.float64)
     rng = np.random.default_rng(random_seed)
     n_points: int = point_cloud.shape[0]
@@ -50,7 +56,7 @@ def ransac(
             break
 
         current_point_cloud: FloatArray = point_cloud[remaining_indices]
-        consensus_context = create_metal_consensus_context(current_point_cloud, error_metric=consensus_metric)
+        consensus_context = create_metal_consensus_context(current_point_cloud, error_metric=consensus_metric, model_family=model_family)
         best_model: Optional[SuperQuadricParams] = None
         best_inliers: BoolArray = np.zeros(current_point_cloud.shape[0], dtype=bool)
 
@@ -61,7 +67,9 @@ def ransac(
             sample_pts: FloatArray = current_point_cloud[idx]
 
             try:
-                H_j: SuperQuadricParams = fit_superquadric_ls(sample_pts, error_metric="radial")
+                H_j: SuperQuadricParams = fit_superquadric_ls(sample_pts, error_metric=error_metric, model_family=model_family)
+            except SuperflexMetalError:
+                raise
             except Exception:
                 continue
 
@@ -95,6 +103,7 @@ def ransac(
                         random_seed=int(rng.integers(0, np.iinfo(np.int32).max)),
                         deadline=deadline,
                         consensus_context=consensus_context,
+                        model_family=model_family,
                     )
                     if inner_result.best_inlier_count > 0:
                         current_inliers = np.asarray(inner_result.best_inliers_mask, dtype=bool)
@@ -114,12 +123,14 @@ def ransac(
 
         # Final refit on all inliers
         best_points = current_point_cloud[best_inliers]
-        if best_points.shape[0] >= 11:
+        if best_points.shape[0] >= parameter_count(model_family):
             try:
                 refit_model = fit_superquadric_ls(
                     best_points,
                     error_metric=error_metric,
                     bounds_reference_points=best_points,
+                    model_family=model_family,
+                    initial_model=best_model if model_family == "superflex" else None,
                 )
                 refit_inliers = np.asarray(
                     compute_consensus(refit_model, current_point_cloud, threshold, error_metric=consensus_metric, metal_context=consensus_context),
@@ -130,6 +141,8 @@ def ransac(
                     best_model = refit_model
                     best_inliers = refit_inliers
                     best_count = refit_count
+            except SuperflexMetalError:
+                raise
             except Exception:
                 pass
 

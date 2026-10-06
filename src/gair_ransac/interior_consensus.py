@@ -81,9 +81,10 @@ def evaluate_model_consensus(
 def interior_strength(model: SuperQuadricParams, points: np.ndarray, threshold: float) -> np.ndarray:
     if not np.isfinite(threshold) or threshold <= 0.0:
         raise ValueError("interior scoring requires a finite, positive threshold")
-    canonical = (np.asarray(points, dtype=np.float64) - model.t) @ model.rotation_matrix()
+    local = (np.asarray(points, dtype=np.float64) - model.t) @ model.rotation_matrix()
+    canonical = model.inverse_deform(local)
     axes = np.array([model.a1, model.a2, model.a3])
-    radius = np.linalg.norm(canonical, axis=1)
+    radius = np.linalg.norm(local, axis=1)
     with np.errstate(divide="ignore"):
         logs = np.log(np.abs(canonical / axes))
     log_xy = np.logaddexp((2.0 / model.e2) * logs[:, 0], (2.0 / model.e2) * logs[:, 1])

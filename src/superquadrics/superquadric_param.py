@@ -79,3 +79,16 @@ class SuperQuadricParams:
         # Angles are in radians
         # R = Rz(yaw) @ Ry(pitch) @ Rx(roll)
         return rotz(yaw) @ roty(pitch) @ rotx(roll)
+
+    @property
+    def parameter_count(self) -> int:
+        return 11
+
+    def deform(self, canonical_points: np.ndarray) -> np.ndarray:
+        return np.asarray(canonical_points, dtype=np.float64)
+
+    def inverse_deform(self, local_points: np.ndarray) -> np.ndarray:
+        return np.asarray(local_points, dtype=np.float64)
+
+    def gradient_to_world(self, local_points: np.ndarray, canonical_gradient: np.ndarray) -> np.ndarray:
+        return canonical_gradient @ self.rotation_matrix().T

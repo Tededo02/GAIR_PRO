@@ -12,6 +12,7 @@ from src.gair_ransac.axis_regularization import DEFAULT_AXIS_PENALTY_WEIGHT
 from src.gair_ransac.interior_consensus import DEFAULT_INTERIOR_PENALTY_WEIGHT, validate_interior_penalty_weight
 from src.gair_ransac.normals_estimation import estimate_normals_open3d_consistent
 from src.superquadrics import superquadric_mesh as supmesh
+from src.superquadrics.model_family import MODEL_FAMILIES, parameter_count, validate_model_family
 from src.visualizations import plot as vis
 
 
@@ -19,6 +20,7 @@ PC_NAME = "car_pc_resized_100000.ply"
 
 
 ALGORITHM_NAME = "gair"
+MODEL_FAMILY = "rigid"  # Options: "rigid" (11 parameters), "superflex" (19 parameters).
 ROOT = Path(__file__).resolve().parent
 PC_DIR = ROOT / "test_objects" / "real" 
 TEST_OBJECTS_DIR = ROOT / "test_objects"
@@ -27,7 +29,7 @@ K_NEIGHBORS = 90
 THRESHOLD = 0.010 # if 0 use point spacing to compute effective threshold
 THRESHOLD_SPACING_FACTOR = 2.0
 M_NEIGHBORS = 8
-MAX_MODELS = 20
+MAX_MODELS = 10
 MAX_ITERATIONS = 40
 INNER_ITERATIONS = 80
 SAMPLE_SIZE = 30
@@ -158,6 +160,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("input_file", nargs="?", default=PC_DIR / PC_NAME)
     parser.add_argument("--mesh-samples", type=int, default=MESH_SAMPLE_COUNT)
     parser.add_argument("--seed", type=int, default=RANDOM_SEED)
+    parser.add_argument("--model-family", choices=MODEL_FAMILIES, default=MODEL_FAMILY)
     parser.add_argument("--axis-penalty-weight", type=float, default=AXIS_PENALTY_WEIGHT)
     parser.add_argument("--interior-penalty-weight", type=float, default=INTERIOR_PENALTY_WEIGHT)
     return parser.parse_args(argv)
@@ -168,6 +171,7 @@ def main(argv: list[str] | None = None) -> int:
         argv = sys.argv[1:]
 
     args = parse_args(argv)
+    model_family = validate_model_family(args.model_family)
     if not np.isfinite(args.axis_penalty_weight) or args.axis_penalty_weight < 0.0:
         raise ValueError("axis_penalty_weight must be finite and non-negative")
     validate_interior_penalty_weight(args.interior_penalty_weight)
@@ -204,6 +208,7 @@ def main(argv: list[str] | None = None) -> int:
         print("Running GAIR-RANSAC")
     else:
         print("Running GC-RANSAC")
+    print(f"Models | family={model_family} parameters={parameter_count(model_family)}")
     print(f"Excess-axis penalty | weight={args.axis_penalty_weight:g}")
     print(f"Coherent-interior penalty | weight={args.interior_penalty_weight:g}")
     models, inliers_masks, total_best_mss_used, total_local_opts = gair_ransac(
@@ -222,6 +227,7 @@ def main(argv: list[str] | None = None) -> int:
         energy_strategy=FullGairEnergy() if ALGORITHM_NAME == "gair" else GcRansacEnergy(),
         axis_penalty_weight=args.axis_penalty_weight,
         interior_penalty_weight=args.interior_penalty_weight,
+        model_family=model_family,
     )
     if not models:
         raise RuntimeError("gair_ransac did not return any model")

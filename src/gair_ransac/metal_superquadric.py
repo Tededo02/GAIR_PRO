@@ -4,6 +4,7 @@ from pathlib import Path
 import platform
 
 import numpy as np
+from src.superquadrics.model_family import parameter_count, validate_model_family
 
 
 @dataclass
@@ -35,17 +36,17 @@ def metal_available() -> bool:
     return _metal_runtime() is not None
 
 
-@lru_cache(maxsize=1)
-def _fit_kernel():
+@lru_cache(maxsize=2)
+def _fit_kernel(model_family: str = "rigid"):
     mx = _metal_runtime()
     if mx is None:
         raise RuntimeError("Metal fitting requires Apple silicon, an accessible GPU and MLX; run uv sync")
     directory = Path(__file__).parent
     return mx.fast.metal_kernel(
-        name="superquadric_bounded_soft_l1_batch_fit",
+        name=f"{model_family}_bounded_soft_l1_batch_fit",
         input_names=["points", "initial", "bounds", "options", "axis_support"],
         output_names=["fitted", "diagnostics"],
-        header=(directory / "superquadric_fit_helpers.metal").read_text(),
+        header=(directory / "superquadric_fit_helpers.metal").read_text() + "\n" + (directory / "superflex_geometry.metal").read_text(),
         source=(directory / "superquadric_fit.metal").read_text(),
     )
 
@@ -60,21 +61,24 @@ def fit_superquadric_metal_batch(
     max_nfev: int | np.ndarray = 1000,
     axis_penalty_weight: float | np.ndarray = 0.0,
     axis_support: np.ndarray | None = None,
+    model_family: str = "rigid",
 ) -> MetalBatchFitResult:
     """Optimize independent (B, N, 3) samples in one Metal dispatch.
 
     Bounds may be shared (11,) or supplied per fit (B, 11). Failed fits are
     identified by result.success without discarding successful batch entries.
     """
+    validate_model_family(model_family)
+    n_parameters = parameter_count(model_family)
     points = np.asarray(points, dtype=np.float64)
-    if points.ndim != 3 or points.shape[2] != 3 or points.shape[1] < 11:
-        raise ValueError("points must have shape (B, N, 3) with at least 11 points per fit")
+    if points.ndim != 3 or points.shape[2] != 3 or points.shape[1] < n_parameters or not np.isfinite(points).all():
+        raise ValueError(f"points must be finite with shape (B, N, 3) and at least {n_parameters} points per fit")
     batch_size, point_count, _ = points.shape
     initial_parameters = np.asarray(initial_parameters, dtype=np.float64)
-    if initial_parameters.shape != (batch_size, 11):
-        raise ValueError("initial_parameters must have shape (B, 11)")
+    if initial_parameters.shape != (batch_size, n_parameters) or not np.isfinite(initial_parameters).all():
+        raise ValueError(f"initial_parameters must be finite with shape (B, {n_parameters})")
     if batch_size == 0:
-        return MetalBatchFitResult(np.empty((0, 11)), np.empty((0, 3)))
+        return MetalBatchFitResult(np.empty((0, n_parameters)), np.empty((0, 3)))
     scales = np.broadcast_to(np.asarray(length_scale, dtype=np.float64), (batch_size,)).copy()
     loss_scales = np.broadcast_to(np.asarray(robust_loss_scale, dtype=np.float64), (batch_size,))
     limits = np.broadcast_to(np.asarray(max_nfev, dtype=np.float64), (batch_size,))
@@ -94,8 +98,10 @@ def fit_superquadric_metal_batch(
     support_boxes = np.broadcast_to(np.asarray(axis_support, dtype=np.float64), (batch_size, 3, 3))
     if not np.isfinite(support_boxes).all() or np.any(np.linalg.det(support_boxes) == 0.0):
         raise ValueError("axis_support must contain finite, nonsingular (3, 3) support boxes")
-    lower_bounds = np.broadcast_to(np.asarray(lower_bounds, dtype=np.float64), (batch_size, 11))
-    upper_bounds = np.broadcast_to(np.asarray(upper_bounds, dtype=np.float64), (batch_size, 11))
+    lower_bounds = np.broadcast_to(np.asarray(lower_bounds, dtype=np.float64), (batch_size, n_parameters))
+    upper_bounds = np.broadcast_to(np.asarray(upper_bounds, dtype=np.float64), (batch_size, n_parameters))
+    if not np.isfinite(lower_bounds).all() or not np.isfinite(upper_bounds).all() or np.any(lower_bounds >= upper_bounds):
+        raise ValueError("bounds must be finite with lower_bounds < upper_bounds")
 
     # Normalize before converting to float32 to preserve small shapes at large world coordinates.
     origins = initial_parameters[:, 8:11].copy()
@@ -114,7 +120,7 @@ def fit_superquadric_metal_batch(
     mx = _metal_runtime()
     if mx is None:
         raise RuntimeError("Metal fitting requires Apple silicon, an accessible GPU and MLX; run uv sync")
-    kernel = _fit_kernel()
+    kernel = _fit_kernel(model_family)
     fitted, diagnostics = kernel(
         inputs=[
             mx.array(normalized_points.astype(np.float32)),
@@ -123,10 +129,10 @@ def fit_superquadric_metal_batch(
             mx.array(options),
             mx.array((support_boxes / scales[:, None, None]).astype(np.float32)),
         ],
-        template=[("THREADS", threads)],
+        template=[("THREADS", threads), ("PARAMETERS", n_parameters)],
         grid=(threads, batch_size, 1),
         threadgroup=(threads, 1, 1),
-        output_shapes=[(batch_size, 11), (batch_size, 3)],
+        output_shapes=[(batch_size, n_parameters), (batch_size, 3)],
         output_dtypes=[mx.float32, mx.float32],
         stream=mx.gpu,
     )

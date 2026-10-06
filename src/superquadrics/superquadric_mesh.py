@@ -76,7 +76,7 @@ def apply_pose(points, superquadric:SuperQuadricParams):
     t = superquadric.t
     R = np.asarray(R, float)
     t = np.asarray(t, float).reshape(3,)
-    return (R @ points.T).T + t[None, :]
+    return (R @ superquadric.deform(points).T).T + t[None, :]
 
 
 

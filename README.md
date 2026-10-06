@@ -1,12 +1,89 @@
 # 3D superquadric decomposition
 
+`main_scan_pc.py` selects its primitive family with the global `MODEL_FAMILY`:
+
+```python
+MODEL_FAMILY = "rigid"      # Fit the original 11-parameter superquadrics.
+MODEL_FAMILY = "superflex"  # Also fit tapering and bending with 19 parameters.
+```
+
+The default is `"rigid"`. A command-line override is also available:
+
+```sh
+uv run main_scan_pc.py test_objects/real/car_pc_resized_100000.ply --model-family rigid
+uv run main_scan_pc.py test_objects/real/car_pc_resized_100000.ply --model-family superflex
+```
+
+The SuperFlex family follows [SuperFlex, Section 3 and Appendix A.1](https://arxiv.org/html/2607.01015):
+three semi-axes, two shape exponents, three rotation angles, three translations,
+two taper coefficients, and a curvature/plane-angle pair for each of the x, y,
+and z axes. Setting all deformation coefficients to zero recovers the rigid
+family; tapering-only, bending-only, and combined shapes use the same model.
+The forward composition is tapering, y-bending, x-bending, z-bending, then pose.
+The implicit function applies the inverse operations in reverse order.
+
+The scan entry point supports both GAIR-RANSAC and GC-RANSAC through its existing
+`ALGORITHM_NAME` selection. The family is propagated to hypotheses, graph-cut
+local refinements, and final refits for both PLY clouds and sampled STL meshes.
+`main_pc_import.py` also supports the family selection for LS, inner-RANSAC,
+RANSAC, GAIR-RANSAC, and GC-RANSAC. Residuals, transformed normals,
+interior scoring, meshes, surface coverage, and reconstruction evaluation all
+use the selected geometry. This extends the existing per-cloud fitting algorithm
+with the paper's primitive representation; it does not train the paper's network.
+
+SuperFlex fitting and consensus now run on Metal. Both `backend="auto"` and
+`backend="metal"` require an accessible Apple silicon GPU and MLX for this family;
+GPU failures are reported without retrying the optimization on the CPU.
+Explicit `backend="cpu"` is retained as a SciPy reference for comparisons.
+The original rigid path continues to select Metal automatically. The extended fitter uses analytic derivatives,
+Cartesian curvature components to remain differentiable at zero bending,
+three principal-axis initializations for tapering, and the previous model as
+the starting point for final refits. The stored `bending` array has shape `(3, 2)`
+and contains `(curvature, plane_angle)` rows in x, y, z order. The extended radial
+Jacobian's final six columns use Cartesian curvature components rather than
+curvature/angle coordinates. Tapering is bounded to `[-0.999, 0.999]` during fitting;
+curvature components are bounded to `[-4, 4]` after multiplication by the
+reference cloud's bounding-box diagonal.
+
+The shared Metal solver specializes to either 11 or 19 parameters. The complete
+optimization runs inside the kernel, including deformation inversion, residuals,
+analytic Jacobians, robust weighting, the damped linear solve, bound projection,
+axis regularization, and convergence checks. SuperFlex hypotheses are submitted
+in batches of up to 80: a rigid Metal dispatch prepares their warm starts, then
+one extended dispatch fits three axis initializations per hypothesis. Final
+refits start from the winning deformed model instead of resetting its deformations.
+
+SuperFlex consensus evaluates inverse tapering and all three inverse bends,
+transformed normals, inlier masks, and interior strengths on the GPU. The
+existing interior-mass kernel also runs on Metal and retains the original-cloud
+neighbor graph across extractions. Its consensus decisions stay in float32 and
+do not invoke the rigid family's CPU boundary corrections.
+
+As in rigid mode, PCA initialization, bound preparation, RANSAC bookkeeping,
+sampling, the neighbor graph, graph-cut optimization, and visualization remain
+on the CPU. These steps do not call the SciPy least-squares optimizer in the
+SuperFlex Metal path.
+
+```python
+from src.gair_ransac.inner_ransac import fit_superquadric_ls
+
+model = fit_superquadric_ls(points, model_family="superflex")  # Require Metal automatically.
+print(model.taper, model.bending)
+```
+
+Run the geometry, derivative, fitting, and pipeline checks with:
+
+```sh
+.venv/bin/python -m unittest discover -s checks -v
+```
+
 `fit_superquadric_ls` automatically uses a custom Metal kernel on Apple silicon
 when MLX and the GPU are available. Install the project dependencies with `uv sync`.
-MLX is included only on macOS arm64; other platforms use SciPy.
+MLX is included only on macOS arm64; rigid fitting uses SciPy on other platforms.
 
 The Metal kernel runs the entire bounded least-squares optimization on the GPU:
 radial residuals, analytic derivatives, `soft_l1` weighting, damped Gauss-Newton
-steps, the 11-parameter linear solve, and convergence checks. PCA initialization
+steps, the 11- or 19-parameter linear solve, and convergence checks. PCA initialization
 and bound preparation remain in NumPy. Kernel compilation is cached per process.
 Points and parameters are normalized before conversion to float32 to preserve
 precision for small shapes at large world coordinates. This solver minimizes
@@ -106,12 +183,12 @@ GAIR-RANSAC uploads the original cloud, normals, and neighbor graph once and use
 active-point masks across extractions. The consensus kernel also emits interior
 strengths; a second kernel gathers neighbors and reduces the coherent mass.
 Only counts, masses, scores, and the winning mask are returned for each inner batch, together with sparse indices
-for ambiguous points near residual/normal thresholds. Those points are rechecked
+for ambiguous rigid-model points near residual/normal thresholds. Those points are rechecked
 in float64 on the CPU to avoid changing consensus decisions through float32
 rounding. GPU masks and interior strengths for other candidates stay on the device.
 Setting `interior_penalty_weight=0` skips interior computation and the neighbor kernel.
 
-Without Metal, or for other residual metrics, consensus uses NumPy and evaluates
+For rigid models without Metal, or for other rigid residual metrics, consensus uses NumPy and evaluates
 model normals only for points that pass the residual threshold. Deadlines are
 checked before each batch; in-flight GPU dispatches complete before returning.
 If fitting overruns a deadline, the first completed candidate is still scored,

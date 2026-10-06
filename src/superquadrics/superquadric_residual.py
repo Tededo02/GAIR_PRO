@@ -1,5 +1,6 @@
 import numpy as np
 from .superquadric_param import SuperQuadricParams, rotz, roty, rotx
+from .deformable_superquadric import DeformableSuperQuadricParams, deformable_radial_residual_and_jacobian
 
 
 def _drotz(yaw: float) -> np.ndarray:
@@ -50,7 +51,7 @@ def _points_in_canonical_frame(
 ) -> tuple[np.ndarray, np.ndarray]:
     rotation_matrix = model.rotation_matrix()
     centered_points = np.asarray(points, dtype=np.float64) - model.t
-    return rotation_matrix, centered_points @ rotation_matrix
+    return rotation_matrix, model.inverse_deform(centered_points @ rotation_matrix)
 
 
 def _superquadric_shape_value_from_pc(
@@ -135,7 +136,11 @@ def superquadric_first_order_residual(model: SuperQuadricParams, points: np.ndar
     f = v + w - 1.0
 
     grad_canonical = _superquadric_gradient_canonical_from_pc(model, pc, eps)
-    grad_norm = np.linalg.norm(grad_canonical, axis=1)
+    if model.parameter_count == 11:
+        grad_norm = np.hypot.reduce(grad_canonical, axis=1)
+    else:
+        local = (np.asarray(points, dtype=np.float64) - model.t) @ model.rotation_matrix()
+        grad_norm = np.hypot.reduce(model.gradient_to_world(local, grad_canonical), axis=1)
     grad_norm = np.maximum(grad_norm, 1e-9)
     return f / grad_norm
 
@@ -147,8 +152,13 @@ def superquadric_normal_world(
 ) -> np.ndarray:
     R, pc = _points_in_canonical_frame(model, points)
     grad_canonical = _superquadric_gradient_canonical_from_pc(model, pc, eps)
-    grad_world = grad_canonical @ R.T
-    grad_norm = np.linalg.norm(grad_world, axis=1, keepdims=True)
+    if model.parameter_count == 11:
+        grad_world = grad_canonical @ R.T
+    else:
+        local = (np.asarray(points, dtype=np.float64) - model.t) @ R
+        grad_world = model.gradient_to_world(local, grad_canonical)
+    # Sharp exponents and inverse tapering can produce finite gradients whose squares overflow.
+    grad_norm = np.hypot.reduce(grad_world, axis=1, keepdims=True)
     grad_norm = np.maximum(grad_norm, 1e-9)
     return grad_world / grad_norm
 
@@ -157,7 +167,9 @@ def superquadric_normal_world(
 # then computes the length of the segment from the surface to the point
 def  superquadric_radial_residual(model: SuperQuadricParams, points: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     _, pc = _points_in_canonical_frame(model, points)
-    r = np.maximum(np.linalg.norm(pc, axis=1), eps)
+    # SuperFlex Eq. (3) uses the radius before inverse deformations.
+    radial_points = pc if model.parameter_count == 11 else np.asarray(points, dtype=np.float64) - model.t
+    r = np.maximum(np.linalg.norm(radial_points, axis=1), eps)
     shape_value = _superquadric_shape_value_from_pc(model, pc)
     r_surface = r * np.maximum(shape_value, eps) ** (-model.e1 / 2.0)
     return r - r_surface
@@ -170,6 +182,8 @@ def superquadric_radial_residual_and_jacobian(
     points: np.ndarray,
     eps: float = 1e-12,
 ) -> tuple[np.ndarray, np.ndarray]:
+    if isinstance(model, DeformableSuperQuadricParams):
+        return deformable_radial_residual_and_jacobian(model, points, eps)
     points = np.asarray(points, dtype=np.float64)
     R, dR_dyaw, dR_dpitch, dR_droll = _rotation_matrix_and_derivatives(model.rot)
     centered = points - model.t
@@ -310,7 +324,7 @@ def superquadric_combo(model: SuperQuadricParams, points: np.ndarray, eps: float
     a1, a2, a3 = model.a1, model.a2, model.a3
     AXIS_THRESHOLD = 0.7 # sensitivity of the axis distance (1 is full radial, 0 is full first order)
 
-    pc = (points - model.t) @ R 
+    pc = model.inverse_deform((points - model.t) @ R)
 
     # direction normalised by semi-axes so the measure is shape-aware
     n = np.stack([np.abs(pc[:, 0] / a1),

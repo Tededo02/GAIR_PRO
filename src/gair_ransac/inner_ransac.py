@@ -3,10 +3,13 @@ from typing import Iterator, Optional
 import time
 import numpy as np
 from src.superquadrics.superquadric_param import SuperQuadricParams
+from src.superquadrics.deformable_superquadric import DeformableSuperQuadricParams
+from src.superquadrics.model_family import parameter_count, validate_model_family
 from scipy.optimize import least_squares
 from .consensus import compute_consensus
 from .metal_superquadric import fit_superquadric_metal, fit_superquadric_metal_batch, metal_available
 from .metal_consensus import MetalConsensusContext, create_metal_consensus_context
+from .metal_superflex import SuperflexMetalError
 from src.superquadrics.superquadric_residual import superquadric_radial_residual_and_jacobian
 from .axis_regularization import (
     DEFAULT_AXIS_PENALTY_WEIGHT, axis_penalty_residual_and_jacobian,
@@ -53,6 +56,11 @@ def _pca_initial_parameters(point_batches: np.ndarray) -> np.ndarray:
     lower_quantile, upper_quantile = np.percentile(pca_coordinates, [5.0, 95.0], axis=1)
     semi_axes = np.maximum(0.525 * (upper_quantile - lower_quantile), 1e-3)
 
+    angles = _euler_from_rotation_matrices(rotation_matrix)
+    return np.column_stack((semi_axes, np.full((len(point_batches), 2), 1.5), angles, centers))
+
+
+def _euler_from_rotation_matrices(rotation_matrix: np.ndarray) -> np.ndarray:
     sin_pitch = np.clip(-rotation_matrix[:, 2, 0], -1.0, 1.0)
     pitch = np.arcsin(sin_pitch)
     cos_pitch = np.cos(pitch)
@@ -63,7 +71,7 @@ def _pca_initial_parameters(point_batches: np.ndarray) -> np.ndarray:
         np.arctan2(-rotation_matrix[:, 0, 1], rotation_matrix[:, 1, 1]),
         np.arctan2(rotation_matrix[:, 2, 1], rotation_matrix[:, 2, 2]),
     )
-    return np.column_stack((semi_axes, np.full((len(point_batches), 2), 1.5), yaw, pitch, roll, centers))
+    return np.column_stack((yaw, pitch, roll))
 
 
 def _reference_axis_upper_bounds(
@@ -148,16 +156,22 @@ def fit_superquadric_ls(
     bounds_reference_points: np.ndarray | None = None,
     backend: str = "auto",
     axis_penalty_weight: float = DEFAULT_AXIS_PENALTY_WEIGHT,
+    model_family: str = "rigid",
+    initial_model: SuperQuadricParams | None = None,
 ) -> SuperQuadricParams:
     """Fit on Metal when available, or select the explicit 'metal'/'cpu' backend.
 
     Metal and CPU share the radial soft_l1 objective and quadratic excess-axis penalty.
     PCA initialization and optimization bounds are prepared on the CPU.
     """
-    del error_metric
+    validate_model_family(model_family)
     axis_penalty_weight = validate_axis_penalty_weight(axis_penalty_weight)
     if backend not in {"auto", "metal", "cpu"}:
         raise ValueError("backend must be 'auto', 'metal' or 'cpu'")
+    if model_family == "superflex":
+        from .deformable_fitting import fit_deformable_superquadric_ls
+        return fit_deformable_superquadric_ls(points, bounds_reference_points, axis_penalty_weight, initial_model, backend=backend)
+    del error_metric
     point_array = np.asarray(points, dtype=np.float64)
     if point_array.ndim != 2 or point_array.shape[1] != 3 or not np.isfinite(point_array).all():
         raise ValueError("points must be a finite array with shape (N, 3)")
@@ -166,6 +180,8 @@ def fit_superquadric_ls(
 
     # Share initialization and bound preparation with the batched fitting path.
     initial_parameters = _pca_initial_parameters(point_array[None, :, :])[0]
+    if initial_model is not None:
+        initial_parameters = np.r_[initial_model.a1, initial_model.a2, initial_model.a3, initial_model.e1, initial_model.e2, initial_model.rot, initial_model.t]
     reference_points = point_array if bounds_reference_points is None else np.asarray(bounds_reference_points, dtype=np.float64)
     reference_model = _model_from_parameters(initial_parameters) if bounds_reference_points is None else None
     lower_bounds, upper_bounds, robust_loss_scale, reference_diagonal = _optimization_bounds(reference_points, reference_model)
@@ -272,6 +288,7 @@ def inner_ransac(
     axis_penalty_weight: float = DEFAULT_AXIS_PENALTY_WEIGHT,
     interior_context: InteriorPenaltyContext | None = None,
     min_inliers: int = 0,
+    model_family: str = "rigid",
 ) -> InnerRansacResult:
     """Fit and score independent 40-point hypotheses in batches of up to 80.
 
@@ -279,9 +296,13 @@ def inner_ransac(
     and launching each batch. In-flight GPU fitting and consensus dispatches
     finish before returning the best result found so far.
     """
+    validate_model_family(model_family)
     axis_penalty_weight = validate_axis_penalty_weight(axis_penalty_weight)
     if interior_context is None and consensus_context is not None:
         interior_context = consensus_context.interior_context
+    if model_family == "superflex":
+        from .metal_superflex import require_superflex_metal
+        require_superflex_metal()
     score_enabled = interior_context is not None and interior_context.weight > 0.0
     point_cloud = np.asarray(point_cloud, dtype=np.float64)
     refined_set_index = np.asarray(refined_set_index, dtype=np.int64)
@@ -304,9 +325,9 @@ def inner_ransac(
         consensus_metric = error_metric
     if refined_set_index.size == 0 or actual_points.shape[0] == 0:
         return InnerRansacResult(
-            best_model=SuperQuadricParams(1, 1, 1, 1, 1, [0, 0, 0], [0, 0, 0]),
+            best_model=(SuperQuadricParams if model_family == "rigid" else DeformableSuperQuadricParams)(1, 1, 1, 1, 1),
             best_inlier_count=0,
-            best_inliers_mask=np.empty((0,), dtype=bool),
+            best_inliers_mask=np.zeros(actual_points.shape[0], dtype=bool),
         )
     size_sample = min(np.size(refined_set_index), sample_size)
     if consensus_context is not None:
@@ -319,6 +340,7 @@ def inner_ransac(
         point_cloud, refined_set_index, bounds_reference_points,
         size_sample, n_iters, rng, error_metric, deadline,
         axis_penalty_weight,
+        model_family,
     ):
         if not candidate_models:
             continue
@@ -331,6 +353,7 @@ def inner_ransac(
             consensus_context = create_metal_consensus_context(
                 actual_points, actual_normals, consensus_metric,
                 interior_context=interior_context if score_enabled else None, active_indices=active_indices,
+                model_family=model_family,
             )
         # Keep the first completed candidate when a fitting dispatch overruns the deadline.
         if deadline is not None and time.perf_counter() >= deadline:
@@ -381,18 +404,20 @@ def inner_ransac(
 
     if best_count < 0 or best_model is None:
         return InnerRansacResult(
-            best_model=SuperQuadricParams(1, 1, 1, 1, 1, [0, 0, 0], [0, 0, 0]),
+            best_model=(SuperQuadricParams if model_family == "rigid" else DeformableSuperQuadricParams)(1, 1, 1, 1, 1),
             best_inlier_count=0,
-            best_inliers_mask=np.empty((0,), dtype=bool),
+            best_inliers_mask=np.zeros(actual_points.shape[0], dtype=bool),
         )
     inlier_points = actual_points[best_inliers]
-    if inlier_points.shape[0] >= 11 and (deadline is None or time.perf_counter() < deadline):
+    if inlier_points.shape[0] >= parameter_count(model_family) and (deadline is None or time.perf_counter() < deadline):
         try:
             refined_model = fit_superquadric_ls(
                 inlier_points,
                 error_metric=error_metric,
                 bounds_reference_points=inlier_points,
                 axis_penalty_weight=axis_penalty_weight,
+                model_family=model_family,
+                initial_model=best_model if model_family == "superflex" else None,
             )
             refined_inlier_mask, refined_inlier_count, refined_score, refined_mass = evaluate_model_consensus(
                 refined_model, actual_points, threshold, consensus_metric, actual_normals,
@@ -409,6 +434,8 @@ def inner_ransac(
                 best_score = refined_score
                 best_mass = refined_mass
                 best_inliers = refined_inlier_mask.astype(bool, copy=False)
+        except SuperflexMetalError:
+            raise
         except Exception:
             pass
     return InnerRansacResult(
@@ -426,11 +453,12 @@ def _inner_candidate_models(
     error_metric: str,
     deadline: float | None,
     axis_penalty_weight: float = DEFAULT_AXIS_PENALTY_WEIGHT,
+    model_family: str = "rigid",
 ) -> Iterator[SuperQuadricParams]:
     # Preserve the individual-candidate iterator for callers and validation tools.
     for models in _inner_candidate_model_batches(
         point_cloud, refined_set_index, bounds_reference_points, size_sample,
-        n_iters, rng, error_metric, deadline, axis_penalty_weight,
+        n_iters, rng, error_metric, deadline, axis_penalty_weight, model_family,
     ):
         for model in models:
             yield model
@@ -448,10 +476,30 @@ def _inner_candidate_model_batches(
     error_metric: str,
     deadline: float | None,
     axis_penalty_weight: float = DEFAULT_AXIS_PENALTY_WEIGHT,
+    model_family: str = "rigid",
 ) -> Iterator[list[SuperQuadricParams]]:
-    if n_iters <= 0 or size_sample < 11:
+    if n_iters <= 0 or size_sample < parameter_count(model_family):
         return
     if deadline is not None and time.perf_counter() >= deadline:
+        return
+    if model_family == "superflex":
+        from .metal_superflex import require_superflex_metal, superflex_optimization_bounds, fit_superflex_hypothesis_batch
+        from .deformable_fitting import _unpack
+        require_superflex_metal()
+        lower, upper, loss_scale, diagonal, support_box = superflex_optimization_bounds(bounds_reference_points, axis_penalty_weight)
+        for start in range(0, n_iters, INNER_RANSAC_BATCH_SIZE):
+            if deadline is not None and time.perf_counter() >= deadline:
+                return
+            sample_indices = [rng.choice(refined_set_index, size=size_sample, replace=False) for _ in range(min(INNER_RANSAC_BATCH_SIZE, n_iters - start))]
+            sampled_points = point_cloud[np.stack(sample_indices)]
+            initial_parameters = _pca_initial_parameters(sampled_points)
+            if deadline is not None and time.perf_counter() >= deadline:
+                return
+            result = fit_superflex_hypothesis_batch(
+                sampled_points, initial_parameters, lower, upper, loss_scale, diagonal,
+                support_box, axis_penalty_weight,
+            )
+            yield [_unpack(parameters, diagonal) for parameters in result.parameters[result.success]]
         return
     if not metal_available():
         # Preserve the sequential SciPy path on machines without Metal.
@@ -464,6 +512,7 @@ def _inner_candidate_model_batches(
                     point_cloud[sample_idx], error_metric=error_metric,
                     bounds_reference_points=bounds_reference_points, backend="cpu",
                     axis_penalty_weight=axis_penalty_weight,
+                    model_family=model_family,
                 )
             except Exception:
                 continue

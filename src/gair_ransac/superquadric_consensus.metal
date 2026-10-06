@@ -8,7 +8,7 @@ threadgroup uint2 sums[THREADS / 32];
 uint inlier = 0, uncertain = 0;
 
 if (point_index < point_count) {
-    uint base = 17 * candidate;
+    uint base = (SUPERFLEX ? 25 : 17) * candidate;
     float3 axes(parameters[base], parameters[base+1], parameters[base+2]);
     float e1 = parameters[base+3], e2 = parameters[base+4];
     float3 displacement(
@@ -19,13 +19,22 @@ if (point_index < point_count) {
     float3 r0(parameters[base+8], parameters[base+9], parameters[base+10]);
     float3 r1(parameters[base+11], parameters[base+12], parameters[base+13]);
     float3 r2(parameters[base+14], parameters[base+15], parameters[base+16]);
-    float3 pc = displacement.x*r0 + displacement.y*r1 + displacement.z*r2;
+    float3 local = displacement.x*r0 + displacement.y*r1 + displacement.z*r2;
+    float3 pc = local;
+    float3x3 inverse_jacobian = float3x3(1.0f);
+    if (SUPERFLEX) {
+        float p[19] = {};
+        p[2] = axes.z;
+        for (int j = 0; j < 8; ++j) p[11+j] = parameters[base+17+j];
+        float3 unused[9];
+        pc = sf_inverse_deformation<HAS_NORMALS, false>(local, p, inverse_jacobian, unused);
+    }
     float3 ratios = abs(pc / axes);
     float pxy = 2.0f / e2, pz = 2.0f / e1, k = e2 / e1;
     float log_u = sq_logadd(pxy*log(ratios.x), pxy*log(ratios.y));
     float raw_log_shape = sq_logadd(k*log_u, pz*log(ratios.z));
     float log_shape = max(raw_log_shape, log(1e-12f));
-    float raw_radius = length(pc);
+    float raw_radius = length(local);
     float radius = max(raw_radius, options[2]);
     float surface_radius = radius * exp(-0.5f * e1 * log_shape);
     float error = abs(radius - surface_radius);
@@ -46,7 +55,7 @@ if (point_index < point_count) {
         interior[candidate*point_count+point_index] = x*x / (x*x+y*y);
     }
     float distance_margin = 128.0f * FLT_EPSILON * max(1.0f, radius + surface_radius);
-    uncertain = is_active && isfinite(threshold) && abs(error-threshold) <= distance_margin;
+    uncertain = !SUPERFLEX && is_active && isfinite(threshold) && abs(error-threshold) <= distance_margin;
     bool accepted = is_active && error < threshold;
 
     if (HAS_NORMALS && accepted && !uncertain) {
@@ -64,14 +73,15 @@ if (point_index < point_count) {
             log_gradient = select(log_gradient, float3(-INFINITY), pc == 0.0f);
             float largest = max(log_gradient.x, max(log_gradient.y, log_gradient.z));
             float3 gradient = largest == -INFINITY ? float3(0.0f) : exp(log_gradient-largest) * sign(pc);
+            if (SUPERFLEX) gradient = transpose(inverse_jacobian) * gradient;
             float3 world_gradient(dot(gradient, r0), dot(gradient, r1), dot(gradient, r2));
             float gradient_length = length(world_gradient);
             float amplitude = gradient_length == 0.0f ? 0.0f : min(1.0f, exp(min(largest + log(gradient_length) - log(1e-9f), 0.0f)));
             float3 model_normal = gradient_length == 0.0f ? float3(0.0f) : amplitude * world_gradient / gradient_length;
             float alignment = clamp(dot(model_normal, observed), -1.0f, 1.0f);
-            uncertain = abs(alignment-options[1]) <= 128.0f*FLT_EPSILON
+            uncertain = !SUPERFLEX && (abs(alignment-options[1]) <= 128.0f*FLT_EPSILON
                 || min(ratios.x, min(ratios.y, ratios.z)) < 128.0f*FLT_EPSILON
-                || largest > 350.0f || !isfinite(alignment);
+                || largest > 350.0f || !isfinite(alignment));
             accepted = alignment >= options[1];
         }
     }

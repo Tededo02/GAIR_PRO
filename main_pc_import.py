@@ -13,6 +13,7 @@ from src.gair_ransac.energy_strategies import FullGairEnergy, GcRansacEnergy
 from src.gair_ransac.ransac import ransac
 from point_cloud_utils import chamfer_distance
 from src.gair_ransac.gair_ransac import gair_ransac
+from src.superquadrics.model_family import MODEL_FAMILIES, parameter_count, validate_model_family
 
 
 THRESHOLD_SCALE = 3.0
@@ -32,6 +33,7 @@ SAMPLED_POINT_COUNT = 6000
 DEFAULT_BASE_SEED = 12345679
 MAX_MODEL = 4
 ALGORITHM = "gair-ransac" # options: "ls", "inner-ransac", "ransac", "gair-ransac", "gc-ransac"
+MODEL_FAMILY = "rigid"  # Options: "rigid" (11 parameters), "superflex" (19 parameters).
 
 @dataclass(frozen=True)
 class RunSeeds:
@@ -152,7 +154,7 @@ def normalize_point_cloud(points: np.ndarray) -> np.ndarray:
     if scale <= 0.0:
         scale = 1.0
 
-    normalized_points = (point_array - bb_min) / scale
+    normalized_points = np.ascontiguousarray((point_array - bb_min) / scale)
     print(
         "  bounding box after normalization: "
         f"min={normalized_points.min(axis=0)}  "
@@ -185,7 +187,9 @@ def compute_effective_threshold(
 def create_and_estimate_supq(
     pc_file: str | Path = PC_FILE,
     base_seed: int = DEFAULT_BASE_SEED,
+    model_family: str | None = None,
 ):
+    model_family = validate_model_family(MODEL_FAMILY if model_family is None else model_family)
     # --- load point cloud from file ---
     run_seeds = build_run_seeds(base_seed)
     input_path = resolve_input_path(pc_file)
@@ -198,6 +202,7 @@ def create_and_estimate_supq(
     effective_threshold, point_spacing = compute_effective_threshold(sampled_points)
 
     print(f"Loaded {sampled_points.shape[0]} points from {input_path.name}")
+    print(f"Models | family={model_family} parameters={parameter_count(model_family)}")
     print(
         "Seeds | "
         f"base={run_seeds.base} "
@@ -224,11 +229,10 @@ def create_and_estimate_supq(
     total_best_mss_used = None
 
     algorithm = ALGORITHM
-    max_models = MAX_MODEL # <-- how many superquadrics to find
+    max_models = MAX_MODEL  # Maximum number of primitives to extract.
 
     if algorithm == "ls":
-        small_sample = sampled_points[:30]
-        theta0 = fit_superquadric_ls(small_sample)
+        theta0 = fit_superquadric_ls(sampled_points, model_family=model_family)
         models = [theta0]
         list_mesh.append(supmesh.superquadric_mesh(theta0))
         colors.append("lightgreen")
@@ -239,19 +243,21 @@ def create_and_estimate_supq(
             actual_set_index=None,
             threshold=effective_threshold,
             random_seed=run_seeds.algorithm,
+            model_family=model_family,
         )
         models = [theta0.best_model]
         list_mesh.append(supmesh.superquadric_mesh(theta0.best_model))
         colors.append("lightgreen")
     elif algorithm == "ransac":
-        models, inliers_masks = ransac(
+        models, inliers_masks, _ = ransac(
             sampled_points,
             threshold=effective_threshold,
             max_models=max_models,
             max_iterations=20,
             inner_iterations=100,
-            graphcut=True,
+            local_optimization=True,
             random_seed=run_seeds.algorithm,
+            model_family=model_family,
         )
         if not models:
             raise RuntimeError("ransac did not return any model")
@@ -277,6 +283,7 @@ def create_and_estimate_supq(
                 if algorithm == "gair-ransac"
                 else GcRansacEnergy()
             ),
+            model_family=model_family,
         )
         if not models:
             raise RuntimeError("gair_ransac did not return any model")
@@ -308,7 +315,7 @@ def create_and_estimate_supq(
             n_points=SAMPLED_POINT_COUNT,
             seed=run_seeds.evaluation_sampling,
         )
-        sample_from_supq_estimated = np.vstack(sampled_estimated)
+        sample_from_supq_estimated = np.ascontiguousarray(np.vstack(sampled_estimated))
         cd = chamfer_distance(sampled_points, sample_from_supq_estimated)
         print(f"reconstruction chamfer = {cd:.4f}")
 
@@ -328,6 +335,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("input_geometry", nargs="?", default=PC_FILE)
     parser.add_argument("--seed", type=int, default=DEFAULT_BASE_SEED)
+    parser.add_argument("--model-family", choices=MODEL_FAMILIES, default=MODEL_FAMILY)
     return parser.parse_args(argv)
 
 
@@ -336,7 +344,7 @@ def main(argv: list[str] | None = None) -> int:
         argv = sys.argv[1:]
 
     args = parse_args(argv)
-    create_and_estimate_supq(args.input_geometry, base_seed=args.seed)
+    create_and_estimate_supq(args.input_geometry, base_seed=args.seed, model_family=args.model_family)
     return 0
 
 

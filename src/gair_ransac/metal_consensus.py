@@ -7,6 +7,7 @@ from typing import Any, Sequence
 import numpy as np
 
 from src.superquadrics.superquadric_param import SuperQuadricParams
+from src.superquadrics.model_family import validate_model_family
 from .metal_superquadric import _metal_runtime, metal_available
 from .interior_consensus import InteriorPenaltyContext, best_score_index, consensus_scores
 
@@ -14,16 +15,17 @@ from .interior_consensus import InteriorPenaltyContext, best_score_index, consen
 CONSENSUS_THREADS = 256
 
 
-@lru_cache(maxsize=1)
-def _consensus_kernel():
+@lru_cache(maxsize=2)
+def _consensus_kernel(superflex: bool = False):
     mx = _metal_runtime()
     if mx is None:
         raise RuntimeError("Metal consensus requires Apple silicon, an accessible GPU and MLX")
+    directory = Path(__file__).parent
     return mx.fast.metal_kernel(
-        name="superquadric_radial_consensus_batch",
+        name="superflex_radial_consensus_batch" if superflex else "superquadric_radial_consensus_batch",
         input_names=["points", "normals", "parameters", "options", "active"],
         output_names=["masks", "partials", "interior"],
-        header="""
+        header=(directory / "superquadric_fit_helpers.metal").read_text() + "\n" + (directory / "superflex_geometry.metal").read_text() + "\n" + """
             float sq_logadd(float a, float b) {
                 float m = max(a, b);
                 return m == -INFINITY ? m : m + log1p(exp(-abs(a-b)));
@@ -193,6 +195,9 @@ class MetalConsensusContext:
         threshold: float,
         normal_cos_threshold: float = 0.0,
     ) -> MetalConsensusResult:
+        if any(model.parameter_count not in (11, 19) for model in models):
+            raise ValueError("Metal consensus supports rigid and SuperFlex models")
+        superflex = any(model.parameter_count == 19 for model in models)
         mx = _metal_runtime()
         batch_size = len(models)
         if not batch_size or not self.point_count:
@@ -201,15 +206,19 @@ class MetalConsensusContext:
                 np.zeros(batch_size, dtype=np.int64), mx.zeros((batch_size, self.point_count), dtype=mx.uint8),
                 interior_masses=masses,
             )
-        parameters = np.stack([
-            np.concatenate((
+        parameter_rows = []
+        for model in models:
+            row = np.concatenate((
                 np.array([model.a1, model.a2, model.a3]) / self.scale,
                 [model.e1, model.e2],
                 (model.t - self.origin) / self.scale,
                 model.rotation_matrix().ravel(),
             ))
-            for model in models
-        ]).astype(np.float32)
+            if superflex:
+                deformation = np.r_[model.taper, (model.bending_components() * self.scale).ravel()] if model.parameter_count == 19 else np.zeros(8)
+                row = np.r_[row, deformation]
+            parameter_rows.append(row)
+        parameters = np.stack(parameter_rows).astype(np.float32)
         score_interior = self.interior_context is not None and self.interior_context.weight > 0.0
         if score_interior and (not np.isfinite(threshold) or threshold <= 0.0):
             raise ValueError("interior scoring requires a finite, positive threshold")
@@ -219,9 +228,9 @@ class MetalConsensusContext:
             threshold / self.scale, normal_cos_threshold,
             1e-12 / self.scale, np.log(self.scale),
         ], dtype=np.float32)
-        masks, partials, interior = _consensus_kernel()(
+        masks, partials, interior = _consensus_kernel(superflex)(
             inputs=[self._gpu_points, self._gpu_normals, mx.array(parameters), mx.array(options), self._gpu_active],
-            template=[("THREADS", CONSENSUS_THREADS), ("HAS_NORMALS", self.normals is not None), ("SCORE_INTERIOR", score_interior)],
+            template=[("THREADS", CONSENSUS_THREADS), ("HAS_NORMALS", self.normals is not None), ("SCORE_INTERIOR", score_interior), ("SUPERFLEX", superflex)],
             grid=(tiles * CONSENSUS_THREADS, batch_size, 1),
             threadgroup=(CONSENSUS_THREADS, 1, 1),
             output_shapes=[(batch_size, point_count), (batch_size, tiles, 2), (batch_size, point_count) if score_interior else (1,)],
@@ -244,7 +253,7 @@ class MetalConsensusContext:
         counts = host_counts[:, 0].copy()
         corrections = {}
         uncertain_count = int(host_counts[:, 1].sum())
-        if uncertain_count:
+        if uncertain_count and not superflex:
             # Compact only ambiguous indices on the GPU; never transfer all candidate masks.
             flat_masks = masks.reshape(-1)
             prefix = mx.cumsum(((flat_masks & 2) != 0).astype(mx.uint32))
@@ -278,8 +287,15 @@ def create_metal_consensus_context(
     error_metric: str = "radial",
     interior_context: InteriorPenaltyContext | None = None,
     active_indices: np.ndarray | None = None,
+    model_family: str = "rigid",
 ) -> MetalConsensusContext | None:
+    validate_model_family(model_family)
     # Other residual metrics and platforms retain their existing CPU implementation.
+    if model_family == "superflex":
+        from .metal_superflex import require_superflex_metal
+        require_superflex_metal()
+        if error_metric != "radial":
+            raise ValueError("SuperFlex Metal consensus supports the radial residual metric")
     if error_metric != "radial" or not metal_available():
         return None
     if interior_context is None or interior_context.weight == 0.0:

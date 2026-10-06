@@ -3,10 +3,13 @@ import time
 import numpy as np
 
 from src.superquadrics.superquadric_param import SuperQuadricParams
+from src.superquadrics.model_family import parameter_count, validate_model_family
+from src.superquadrics.superquadric_residual import superquadric_normal_world
 from .consensus import compute_consensus, expanded_removal_mask
 from .energy_strategies import FullGairEnergy, GairEnergyStrategy
 from .inner_ransac import inner_ransac, fit_superquadric_ls, InnerRansacResult
 from .metal_consensus import create_metal_consensus_context
+from .metal_superflex import SuperflexMetalError
 from .axis_regularization import DEFAULT_AXIS_PENALTY_WEIGHT, validate_axis_penalty_weight
 from .interior_consensus import (
     DEFAULT_INTERIOR_PENALTY_WEIGHT, InteriorPenaltyContext, evaluate_model_consensus,
@@ -64,6 +67,11 @@ def _center_opposes_inlier_normals(
 ) -> bool:
     if inlier_points.shape[0] == 0:
         return False
+    if model.parameter_count > 11:
+        # Bent shapes can be concave, so their center does not determine normal orientation.
+        model_normals = superquadric_normal_world(model, inlier_points)
+        normal_dot = np.einsum("ij,ij->i", model_normals, inlier_normals, optimize=True)
+        return float(np.mean(normal_dot > 0.0)) >= min_fraction
     center_direction = np.asarray(model.t, dtype=np.float64) - inlier_points
     normal_dot = np.einsum("ij,ij->i", center_direction, inlier_normals, optimize=True)
     opposite_fraction = float(np.mean(normal_dot < 0.0))
@@ -83,7 +91,7 @@ def _sample_superquadric_surface(model: "SuperQuadricParams", n: int = 1000) -> 
     z = model.a3 * _sp(np.sin(eta), model.e1)
     pts = np.stack([x, y, z], axis=1)
     R   = model.rotation_matrix()
-    return (pts @ R.T) + model.t
+    return (model.deform(pts) @ R.T) + model.t
 
 
 def gair_ransac(
@@ -108,11 +116,15 @@ def gair_ransac(
     deadline: float | None = None,
     axis_penalty_weight: float = DEFAULT_AXIS_PENALTY_WEIGHT,
     interior_penalty_weight: float = DEFAULT_INTERIOR_PENALTY_WEIGHT,
+    model_family: str = "rigid",
 ) -> tuple[list[SuperQuadricParams], list[BoolArray], FloatArray | None, int]:
     """deadline: an absolute time.perf_counter() value. When set, the per-model iteration
     loop, the graph-cut local-optimization loop, and the inner_ransac refinement step all
     stop immediately once it passes, returning whatever best result was found so far.
     None (default) preserves normal, iteration-count-bounded behavior for run.py."""
+    validate_model_family(model_family)
+    if sample_size < parameter_count(model_family):
+        raise ValueError(f"sample_size must be at least {parameter_count(model_family)} for {model_family}")
     total_best_mss_used: FloatArray | None = None
     axis_penalty_weight = validate_axis_penalty_weight(axis_penalty_weight)
     interior_penalty_weight = validate_interior_penalty_weight(interior_penalty_weight)
@@ -148,6 +160,7 @@ def gair_ransac(
         full_consensus_context = create_metal_consensus_context(
             point_cloud, normals if use_normal_coherence else None, consensus_metric,
             interior_context=interior_context,
+            model_family=model_family,
         )
     models_set: list[SuperQuadricParams] = []
     inliers_set: list[BoolArray] = []
@@ -169,6 +182,7 @@ def gair_ransac(
         else:
             consensus_context = create_metal_consensus_context(
                 current_point_cloud, V if use_normal_coherence else None, consensus_metric,
+                model_family=model_family,
             )
 
         best_model: Optional[SuperQuadricParams] = None
@@ -202,7 +216,10 @@ def gair_ransac(
             try:
                 H_j: SuperQuadricParams = fit_superquadric_ls(
                     M_j, error_metric=error_metric, axis_penalty_weight=axis_penalty_weight,
+                    model_family=model_family,
                 )
+            except SuperflexMetalError:
+                raise
             except Exception:
                 continue
 
@@ -263,6 +280,7 @@ def gair_ransac(
                     axis_penalty_weight=axis_penalty_weight,
                     interior_context=interior_context,
                     min_inliers=min_inliers if score_enabled else 0,
+                    model_family=model_family,
                 )
                 if inner_result.best_inlier_count <= 0 or (score_enabled and inner_result.best_inlier_count < min_inliers):
                     terminate = True
@@ -306,13 +324,15 @@ def gair_ransac(
 
         # Final refit on the full inlier set before extracting the model
         best_points = current_point_cloud[best_inliers]
-        if best_points.shape[0] >= 11:
+        if best_points.shape[0] >= parameter_count(model_family):
             try:
                 refit_model = fit_superquadric_ls(
                     best_points,
                     error_metric=error_metric,
                     bounds_reference_points=best_points,
                     axis_penalty_weight=axis_penalty_weight,
+                    model_family=model_family,
+                    initial_model=best_model if model_family == "superflex" else None,
                 )
                 refit_inliers, refit_count, refit_score, _ = evaluate_model_consensus(
                     refit_model, current_point_cloud, threshold, consensus_metric, V if use_normal_coherence else None,
@@ -326,6 +346,8 @@ def gair_ransac(
                     best_inliers = refit_inliers
                     best_count   = refit_count
                     best_score   = refit_score
+            except SuperflexMetalError:
+                raise
             except Exception:
                 pass
 
