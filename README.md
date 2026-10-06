@@ -65,3 +65,25 @@ with `.venv/bin/python validation/benchmark_metal_consensus.py`. Add `--main-sca
 to compare the complete GAIR algorithm using the current `main_scan_pc.py` input
 and settings, checking all extracted inlier masks and selected samples. The
 benchmark excludes visualization and reports preprocessing separately.
+
+## Original MSS acceleration
+
+MSS retains its original random seeds, all 40 GAIR trials, adaptive k-NN pool
+expansion, fallback behavior, FPS start point, score, and parameters. Only
+neighbor filtering and FPS arithmetic use cached serial Numba kernels. Filtering
+stops once the original truncated pool is known; FPS updates squared distances
+without allocating temporary coordinate arrays at every step. Roundoff guards
+route near-threshold filters and ambiguous FPS maxima through the original NumPy
+operations to preserve decisions and tie breaking. No CPU parallelism or
+`fastmath` is enabled. First use includes JIT compilation or cache loading.
+
+Run exact pool, sample, and RNG regression checks with
+`.venv/bin/python -m unittest validation.test_mss -v`.
+Run `.venv/bin/python validation/benchmark_mss.py --main-scan` to compare the
+frozen original sampler against the optimized sampler on `main_scan_pc.py`'s
+real input. The comparison checks every MSS call, final inlier masks, fitted
+parameters, model count, local optimization count, and RNG state through the
+complete GAIR pipeline. Normal estimation is shared, visualization is excluded,
+and MSS kernel warm-up is excluded from sampling timings. Use `--input path.ply`
+to select another scan. Validation helpers remain in the Git-ignored
+`validation` directory.

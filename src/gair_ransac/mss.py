@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import numpy as np
+from numba import njit
 from scipy.spatial import KDTree, cKDTree
 import pyvista as pv
 
@@ -16,6 +17,110 @@ _PTS_PER_PATCH = 5
 # Voxel side = median NN-spacing × this factor (spatial_walk_mss only).
 # Really important, you can choose how big the single voxel cell is
 _VOXEL_SPACING_FACTOR = 10
+
+# Conservative roundoff guards preserve the NumPy decisions at boundaries.
+_ROUNDING_GUARD = 64.0 * np.finfo(np.float64).eps
+
+
+@njit(cache=True)
+def _serial_farthest_point_indices(points, sample_size, start_idx):
+    n_points = len(points)
+    selected = np.empty(sample_size, dtype=np.int64)
+    min_d2 = np.empty(n_points, dtype=np.float64)
+    selected[0] = start_idx
+    for j in range(n_points):
+        dx = points[j, 0] - points[start_idx, 0]
+        dy = points[j, 1] - points[start_idx, 1]
+        dz = points[j, 2] - points[start_idx, 2]
+        min_d2[j] = dx * dx + dy * dy + dz * dz
+        if not np.isfinite(min_d2[j]):
+            return selected, True
+    min_d2[start_idx] = -1.0
+    for i in range(1, sample_size):
+        next_idx, largest, second = 0, -np.inf, -np.inf
+        for j in range(n_points):
+            value = min_d2[j]
+            if value > largest:
+                second, largest, next_idx = largest, value, j
+            elif value > second:
+                second = value
+        if largest - second <= _ROUNDING_GUARD * max(abs(largest), np.finfo(np.float64).tiny):
+            return selected, True
+        selected[i] = next_idx
+        for j in range(n_points):
+            if min_d2[j] < 0.0:
+                continue
+            dx = points[j, 0] - points[next_idx, 0]
+            dy = points[j, 1] - points[next_idx, 1]
+            dz = points[j, 2] - points[next_idx, 2]
+            d2 = dx * dx + dy * dy + dz * dz
+            if not np.isfinite(d2):
+                return selected, True
+            if d2 < min_d2[j]:
+                min_d2[j] = d2
+        min_d2[next_idx] = -1.0
+    return selected, False
+
+
+@njit(cache=True)
+def _serial_coherent_pool(points, normals, indices, seed_idx, target_size, normal_thr, tangent_thr):
+    filtered = np.empty(target_size, dtype=np.int64)
+    filtered[0] = seed_idx
+    count = 1
+    if count == target_size:
+        return filtered, False
+    nx, ny, nz = normals[seed_idx, 0], normals[seed_idx, 1], normals[seed_idx, 2]
+    for j in indices:
+        if j == seed_idx:
+            continue
+        ax, ay, az = normals[j, 0] * nx, normals[j, 1] * ny, normals[j, 2] * nz
+        normal_align = ax + ay + az
+        if not np.isfinite(normal_align):
+            return filtered[:count], True
+        if abs(normal_align - normal_thr) <= _ROUNDING_GUARD * max(abs(ax) + abs(ay) + abs(az), np.finfo(np.float64).tiny):
+            return filtered[:count], True
+        # A rejected normal cannot pass the original conjunction of filters.
+        if normal_align < normal_thr:
+            continue
+        dx = points[j, 0] - points[seed_idx, 0]
+        dy = points[j, 1] - points[seed_idx, 1]
+        dz = points[j, 2] - points[seed_idx, 2]
+        distance = np.sqrt(dx * dx + dy * dy + dz * dz)
+        if not np.isfinite(distance):
+            return filtered[:count], True
+        if abs(distance - 1e-12) <= _ROUNDING_GUARD * max(distance, 1e-12):
+            return filtered[:count], True
+        if distance > 1e-12:
+            tx, ty, tz = (dx / distance) * nx, (dy / distance) * ny, (dz / distance) * nz
+            tangent_align = abs(tx + ty + tz)
+            if not np.isfinite(tangent_align):
+                return filtered[:count], True
+            if abs(tangent_align - tangent_thr) <= _ROUNDING_GUARD * max(abs(tx) + abs(ty) + abs(tz), np.finfo(np.float64).tiny):
+                return filtered[:count], True
+        else:
+            tangent_align = 0.0
+        if normal_align >= normal_thr and tangent_align <= tangent_thr:
+            filtered[count] = j
+            count += 1
+            # Later neighbors cannot change the original truncated pool.
+            if count == target_size:
+                break
+    return filtered[:count], False
+
+
+def _numpy_coherent_pool(points, normals, indices, seed_idx, normal_thr, tangent_thr):
+    other_idx = indices[indices != seed_idx]
+    if other_idx.size == 0:
+        return np.array([seed_idx], dtype=np.int64)
+    disp = points[other_idx] - points[seed_idx]
+    dist = np.linalg.norm(disp, axis=1)
+    disp_unit = np.zeros_like(disp)
+    valid = dist > 1e-12
+    disp_unit[valid] = disp[valid] / dist[valid, None]
+    normal_align = normals[other_idx] @ normals[seed_idx]
+    tangent_align = np.abs(disp_unit @ normals[seed_idx])
+    keep = (normal_align >= normal_thr) & (tangent_align <= tangent_thr)
+    return np.concatenate(([seed_idx], other_idx[keep]))
 
 
 @dataclass(frozen=True)
@@ -80,6 +185,15 @@ def _farthest_point_indices(
     if start_idx is None:
         start_idx = int(rng.integers(n_points))
 
+    if (type(points) is np.ndarray and points.ndim == 2 and points.shape[1] == 3 and points.dtype == np.float64
+            and isinstance(sample_size, (int, np.integer)) and sample_size > 0
+            and -n_points <= int(start_idx) < n_points):
+        selected, ambiguous = _serial_farthest_point_indices(points, sample_size, int(start_idx))
+        if not ambiguous:
+            return selected
+
+    # Retain the original NumPy path for ties and unsupported array types.
+
     selected = np.empty(sample_size, dtype=int)
     selected[0] = int(start_idx)
 
@@ -112,7 +226,6 @@ def _coherent_local_pool_indices(points: np.ndarray,tree: cKDTree,seed_idx: int,
         idx = np.atleast_1d(idx).astype(np.int64, copy=False)
         return idx[:target_pool_size]
 
-    seed_normal = normals[seed_idx]
     relax_normal = [normal_cos_min, normal_cos_min - 0.2, normal_cos_min - 0.4, -1.0]
     relax_tangent = [tangent_cos_max, tangent_cos_max + 0.1, tangent_cos_max + 0.2, 1.0]
 
@@ -122,20 +235,16 @@ def _coherent_local_pool_indices(points: np.ndarray,tree: cKDTree,seed_idx: int,
             _, idx = tree.query(seed_point, k=current_k)
             idx = np.atleast_1d(idx).astype(np.int64, copy=False)
 
-            other_idx = idx[idx != seed_idx]
-            if other_idx.size == 0:
-                filtered = np.array([seed_idx], dtype=np.int64)
-            else:
-                disp = points[other_idx] - seed_point
-                dist = np.linalg.norm(disp, axis=1)
-                disp_unit = np.zeros_like(disp)
-                valid = dist > 1e-12
-                disp_unit[valid] = disp[valid] / dist[valid, None]
-
-                normal_align = normals[other_idx] @ seed_normal
-                tangent_align = np.abs(disp_unit @ seed_normal)
-                keep = (normal_align >= normal_thr) & (tangent_align <= tangent_thr)
-                filtered = np.concatenate(([seed_idx], other_idx[keep]))
+            ambiguous = True
+            if (type(points) is np.ndarray and type(normals) is np.ndarray
+                    and points.ndim == 2 and points.shape[1] == 3 and points.dtype == np.float64
+                    and normals.shape == points.shape and normals.dtype == np.float64
+                    and target_pool_size > 0):
+                filtered, ambiguous = _serial_coherent_pool(
+                    points, normals, idx, seed_idx, target_pool_size, normal_thr, tangent_thr,
+                )
+            if ambiguous:
+                filtered = _numpy_coherent_pool(points, normals, idx, seed_idx, normal_thr, tangent_thr)
 
             if filtered.size >= target_pool_size or current_k >= n_points:
                 return filtered[:target_pool_size]
