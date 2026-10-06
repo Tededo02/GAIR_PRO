@@ -6,6 +6,7 @@ from src.superquadrics.superquadric_param import SuperQuadricParams
 from .consensus import compute_consensus, expanded_removal_mask
 from .energy_strategies import FullGairEnergy, GairEnergyStrategy
 from .inner_ransac import inner_ransac, fit_superquadric_ls, InnerRansacResult
+from .metal_consensus import create_metal_consensus_context
 from .gair import gair
 from .initgraph import build_knn_graph
 from .mss import (
@@ -94,7 +95,7 @@ def gair_ransac(
     min_gain: int = 1,
     error_metric: str = "radial",
     consensus_metric: str = "radial",
-    inner_iterations: int = 50,
+    inner_iterations: int = 80,
     random_seed: int | None = None,
     min_coverage: float = 0.0,
     use_normal_coherence: bool | None = None,
@@ -137,6 +138,9 @@ def gair_ransac(
         current_point_cloud: FloatArray = point_cloud[remaining_indices]
         V: FloatArray     = normals[remaining_indices]
         V_mss: FloatArray | None = mss_normals[remaining_indices] if mss_normals is not None else None
+        consensus_context = create_metal_consensus_context(
+            current_point_cloud, V if use_normal_coherence else None, consensus_metric,
+        )
 
         best_model: Optional[SuperQuadricParams] = None
         best_inliers: BoolArray = np.zeros(current_point_cloud.shape[0], dtype=bool)
@@ -177,6 +181,7 @@ def gair_ransac(
                     threshold,
                     error_metric=consensus_metric,
                     normals=V if use_normal_coherence else None,
+                    metal_context=consensus_context,
                 ),
                 dtype=bool,
             )
@@ -226,6 +231,7 @@ def gair_ransac(
                     n_iters=inner_iterations,
                     random_seed=int(rng.integers(0, np.iinfo(np.int32).max)),
                     deadline=deadline,
+                    consensus_context=consensus_context,
                 )
                 if inner_result.best_inlier_count <= 0:
                     terminate = True
@@ -268,6 +274,7 @@ def gair_ransac(
                         threshold,
                         error_metric=consensus_metric,
                         normals=V if use_normal_coherence else None,
+                        metal_context=consensus_context,
                     ),
                     dtype=bool,
                 )

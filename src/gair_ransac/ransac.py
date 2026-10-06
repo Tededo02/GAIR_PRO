@@ -5,6 +5,7 @@ import numpy as np
 from src.superquadrics.superquadric_param import SuperQuadricParams
 from .consensus import compute_consensus, expanded_removal_mask
 from .inner_ransac import inner_ransac, fit_superquadric_ls, InnerRansacResult
+from .metal_consensus import create_metal_consensus_context
 from numpy.typing import NDArray
 
 FloatArray = NDArray[np.float64]
@@ -25,7 +26,7 @@ def ransac(
     min_inliers: int = 30,
     error_metric: str = "radial",
     consensus_metric: str = "radial",
-    inner_iterations: int = 50,
+    inner_iterations: int = 80,
     random_seed: int | None = None,
     local_optimization: bool = True,
     deadline: float | None = None,
@@ -49,6 +50,7 @@ def ransac(
             break
 
         current_point_cloud: FloatArray = point_cloud[remaining_indices]
+        consensus_context = create_metal_consensus_context(current_point_cloud, error_metric=consensus_metric)
         best_model: Optional[SuperQuadricParams] = None
         best_inliers: BoolArray = np.zeros(current_point_cloud.shape[0], dtype=bool)
 
@@ -64,7 +66,7 @@ def ransac(
                 continue
 
             candidate_inliers: BoolArray = np.asarray(
-                compute_consensus(H_j, current_point_cloud, threshold, error_metric=consensus_metric),
+                compute_consensus(H_j, current_point_cloud, threshold, error_metric=consensus_metric, metal_context=consensus_context),
                 dtype=bool,
             )
             candidate_count: int = int(np.count_nonzero(candidate_inliers))
@@ -92,6 +94,7 @@ def ransac(
                         n_iters=inner_iterations,
                         random_seed=int(rng.integers(0, np.iinfo(np.int32).max)),
                         deadline=deadline,
+                        consensus_context=consensus_context,
                     )
                     if inner_result.best_inlier_count > 0:
                         current_inliers = np.asarray(inner_result.best_inliers_mask, dtype=bool)
@@ -119,7 +122,7 @@ def ransac(
                     bounds_reference_points=best_points,
                 )
                 refit_inliers = np.asarray(
-                    compute_consensus(refit_model, current_point_cloud, threshold, error_metric=consensus_metric),
+                    compute_consensus(refit_model, current_point_cloud, threshold, error_metric=consensus_metric, metal_context=consensus_context),
                     dtype=bool,
                 )
                 refit_count = int(np.count_nonzero(refit_inliers))

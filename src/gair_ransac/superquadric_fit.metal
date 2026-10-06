@@ -1,15 +1,20 @@
 uint lane = thread_position_in_threadgroup.x;
+uint fit_index = threadgroup_position_in_grid.y;
+uint simd_group = lane / 32, simd_lane = lane % 32;
+uint point_count = uint(points_shape[1]);
+uint point_offset = fit_index * point_count * 3;
 threadgroup float parameters[11], candidate[11], gradient[11], hessian[121];
 threadgroup float lower[11], upper[11], step[11], scales[11];
+threadgroup float partials[THREADS / 32][78];
 threadgroup float current_cost, damping, growth, predicted, step_norm;
 threadgroup int status, evaluations, accepted;
-float count = float(points_shape[0]);
-float loss_scale = options[0], radial_eps = options[1];
-int max_evaluations = int(options[2]);
+float count = float(point_count);
+float loss_scale = options[3 * fit_index], radial_eps = options[3 * fit_index + 1];
+int max_evaluations = int(options[3 * fit_index + 2]);
 if (lane < 11) {
-    parameters[lane] = initial[lane];
-    lower[lane] = bounds[lane];
-    upper[lane] = bounds[11 + lane];
+    parameters[lane] = initial[11 * fit_index + lane];
+    lower[lane] = bounds[22 * fit_index + lane];
+    upper[lane] = bounds[22 * fit_index + 11 + lane];
 }
 if (lane == 0) {
     damping = 1e-3f;
@@ -23,9 +28,9 @@ while (evaluations < max_evaluations && status == 0) {
     float local_p[11], local_g[11] = {}, local_h[66] = {};
     for (int j = 0; j < 11; ++j) local_p[j] = parameters[j];
     float local_cost = 0.0f;
-    for (uint i = lane; i < uint(points_shape[0]); i += 32) {
+    for (uint i = lane; i < point_count; i += THREADS) {
         float jac[11];
-        float3 point(points[3*i], points[3*i+1], points[3*i+2]);
+        float3 point(points[point_offset+3*i], points[point_offset+3*i+1], points[point_offset+3*i+2]);
         float residual = sq_radial<true>(point, local_p, radial_eps, jac);
         float ratio = residual / loss_scale;
         float weight = rsqrt(1.0f + ratio * ratio);
@@ -38,23 +43,34 @@ while (evaluations < max_evaluations && status == 0) {
             }
         }
     }
-    float cost = simd_sum(local_cost) / count;
+    float cost = simd_sum(local_cost);
+    if (simd_lane == 0) partials[simd_group][0] = cost;
     for (int j = 0; j < 11; ++j) {
-        float value = simd_sum(local_g[j]) / count;
-        if (lane == 0) gradient[j] = value;
+        float value = simd_sum(local_g[j]);
+        if (simd_lane == 0) partials[simd_group][1+j] = value;
     }
-    int index = 0;
-    for (int j = 0; j < 11; ++j) {
-        for (int k = 0; k <= j; ++k) {
-            float value = simd_sum(local_h[index++]) / count;
-            if (lane == 0) {
+    for (int index = 0; index < 66; ++index) {
+        float value = simd_sum(local_h[index]);
+        if (simd_lane == 0) partials[simd_group][12+index] = value;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0) {
+        current_cost = 0.0f;
+        for (int group = 0; group < THREADS / 32; ++group) current_cost += partials[group][0] / count;
+        for (int j = 0; j < 11; ++j) {
+            gradient[j] = 0.0f;
+            for (int group = 0; group < THREADS / 32; ++group) gradient[j] += partials[group][1+j] / count;
+        }
+        int index = 0;
+        for (int j = 0; j < 11; ++j) {
+            for (int k = 0; k <= j; ++k) {
+                float value = 0.0f;
+                for (int group = 0; group < THREADS / 32; ++group) value += partials[group][12+index] / count;
                 hessian[11*j+k] = value;
                 hessian[11*k+j] = value;
+                index += 1;
             }
         }
-    }
-    if (lane == 0) {
-        current_cost = cost;
         evaluations += 1;
         float projected_gradient = 0.0f;
         for (int j = 0; j < 11; ++j) {
@@ -120,14 +136,18 @@ while (evaluations < max_evaluations && status == 0) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (int j = 0; j < 11; ++j) local_p[j] = candidate[j];
         local_cost = 0.0f;
-        for (uint i = lane; i < uint(points_shape[0]); i += 32) {
+        for (uint i = lane; i < point_count; i += THREADS) {
             float unused[11];
-            float3 point(points[3*i], points[3*i+1], points[3*i+2]);
+            float3 point(points[point_offset+3*i], points[point_offset+3*i+1], points[point_offset+3*i+2]);
             float residual = sq_radial<false>(point, local_p, radial_eps, unused);
             local_cost += sq_soft_l1(residual, loss_scale);
         }
-        float trial_cost = simd_sum(local_cost) / count;
+        float partial_cost = simd_sum(local_cost);
+        if (simd_lane == 0) partials[simd_group][0] = partial_cost;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         if (lane == 0 && status == 0) {
+            float trial_cost = 0.0f;
+            for (int group = 0; group < THREADS / 32; ++group) trial_cost += partials[group][0] / count;
             evaluations += 1;
             float reduction = current_cost - trial_cost;
             float gain = predicted > 0.0f ? reduction / predicted : -1.0f;
@@ -149,9 +169,9 @@ while (evaluations < max_evaluations && status == 0) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
-if (lane < 11) fitted[lane] = parameters[lane];
+if (lane < 11) fitted[11 * fit_index + lane] = parameters[lane];
 if (lane == 0) {
-    diagnostics[0] = float(status);
-    diagnostics[1] = float(evaluations);
-    diagnostics[2] = current_cost;
+    diagnostics[3 * fit_index] = float(status);
+    diagnostics[3 * fit_index + 1] = float(evaluations);
+    diagnostics[3 * fit_index + 2] = current_cost;
 }
