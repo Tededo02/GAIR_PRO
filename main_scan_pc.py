@@ -16,27 +16,29 @@ from src.superquadrics.model_family import MODEL_FAMILIES, parameter_count, vali
 from src.visualizations import plot as vis
 
 
-PC_NAME = "car_pc_resized_100000.ply"
-
+# Use a filename from test_objects/real or test_objects/model, or a repo-relative path.
+#PC_NAME = "car_pc_resized_100000.ply"
+PC_NAME = "sofa.npz"
 
 ALGORITHM_NAME = "gair"
 MODEL_FAMILY = "superflex"  # Options: "rigid" (11 parameters), "superflex" (19 parameters).
 ROOT = Path(__file__).resolve().parent
-PC_DIR = ROOT / "test_objects" / "real" 
 TEST_OBJECTS_DIR = ROOT / "test_objects"
-SUPPORTED_INPUT_EXTENSIONS = {".ply", ".stl"}
+PC_DIR = TEST_OBJECTS_DIR / "real"
+MODEL_DIR = TEST_OBJECTS_DIR / "model"
+SUPPORTED_INPUT_EXTENSIONS = {".ply", ".stl", ".npz"}
 K_NEIGHBORS = 90
 THRESHOLD = 0.010 # if 0 use point spacing to compute effective threshold
 THRESHOLD_SPACING_FACTOR = 2.0
 M_NEIGHBORS = 8
-MAX_MODELS = 20
+MAX_MODELS = 10
 MAX_ITERATIONS = 40
 INNER_ITERATIONS = 80
 SAMPLE_SIZE = 30
 MIN_INLIERS = 200
 MIN_COVERAGE = 0.1
 MSS_MAX_POOL_FRACTION = 0.18
-RANDOM_SEED = 12345777
+RANDOM_SEED = 1234577
 MESH_SAMPLE_COUNT = 8000
 AXIS_PENALTY_WEIGHT = DEFAULT_AXIS_PENALTY_WEIGHT
 INTERIOR_PENALTY_WEIGHT = DEFAULT_INTERIOR_PENALTY_WEIGHT
@@ -48,6 +50,7 @@ def resolve_input_path(input_file: str | Path) -> Path:
         ROOT / input_path,
         PC_DIR / input_path,
         TEST_OBJECTS_DIR / input_path,
+        MODEL_DIR / input_path,
     ]
 
     for candidate in candidates:
@@ -94,6 +97,31 @@ def sample_mesh_surface(
     return np.asarray(points, dtype=np.float64), normals
 
 
+def load_npz_point_cloud(
+    path: Path,
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
+    with np.load(path, allow_pickle=False) as archive:
+        if "points" not in archive:
+            raise ValueError(f"NPZ input must contain a 'points' array: {path}")
+        points = np.asarray(archive["points"], dtype=np.float64)
+        normals = np.asarray(archive["normals"], dtype=np.float64) if "normals" in archive else None
+
+    if points.ndim != 2 or points.shape[1] != 3 or len(points) == 0:
+        raise ValueError(f"NPZ points must have non-empty shape (N, 3), got {points.shape}: {path}")
+    if not np.isfinite(points).all():
+        raise ValueError(f"NPZ points contain non-finite values: {path}")
+
+    if normals is not None:
+        if normals.shape != points.shape or not np.isfinite(normals).all():
+            raise ValueError(f"NPZ normals must be finite and have shape {points.shape}: {path}")
+        lengths = np.hypot.reduce(normals, axis=1, keepdims=True)
+        if np.any(lengths == 0.0):
+            raise ValueError(f"NPZ normals contain zero-length vectors: {path}")
+        normals = normals / lengths
+
+    return points, None, normals
+
+
 def load_point_cloud(
     path: Path,
     mesh_sample_count: int = MESH_SAMPLE_COUNT,
@@ -103,6 +131,9 @@ def load_point_cloud(
     if suffix not in SUPPORTED_INPUT_EXTENSIONS:
         supported = ", ".join(sorted(SUPPORTED_INPUT_EXTENSIONS))
         raise ValueError(f"Unsupported input extension '{suffix}'. Supported: {supported}")
+
+    if suffix == ".npz":
+        return load_npz_point_cloud(path)
 
     cloud = load_trimesh_geometry(path)
 
@@ -157,7 +188,7 @@ def combine_inlier_masks(inliers_masks: list[np.ndarray]) -> np.ndarray | None:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("input_file", nargs="?", default=PC_DIR / PC_NAME)
+    parser.add_argument("input_file", nargs="?", default=PC_NAME)
     parser.add_argument("--mesh-samples", type=int, default=MESH_SAMPLE_COUNT)
     parser.add_argument("--seed", type=int, default=RANDOM_SEED)
     parser.add_argument("--model-family", choices=MODEL_FAMILIES, default=MODEL_FAMILY)
@@ -202,7 +233,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Estimating normals with Open3D | k_neighbors={K_NEIGHBORS}")
         normals = estimate_normals_open3d_consistent(points, K_NEIGHBORS)
     else:
-        print("Using normals sampled from input mesh faces")
+        if pc_path.suffix.lower() == ".npz":
+            print("Using normals stored in input NPZ")
+        else:
+            print("Using normals sampled from input mesh faces")
         normals = input_normals
     if ALGORITHM_NAME == "gair":
         print("Running GAIR-RANSAC")

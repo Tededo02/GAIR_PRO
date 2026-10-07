@@ -14,6 +14,21 @@ uv run main_scan_pc.py test_objects/real/car_pc_resized_100000.ply --model-famil
 uv run main_scan_pc.py test_objects/real/car_pc_resized_100000.ply --model-family superflex
 ```
 
+`main_scan_pc.py` also reads the `.npz` clouds in `test_objects/model`:
+
+```sh
+uv run main_scan_pc.py chair.npz --model-family rigid
+uv run main_scan_pc.py test_objects/model/chair.npz --model-family superflex
+```
+
+Set `PC_NAME = "chair.npz"` in `main_scan_pc.py` to use that archive when running
+without an input argument. Filenames are resolved in both `test_objects/real`
+and `test_objects/model`. NPZ inputs must contain a finite, non-empty `(N, 3)`
+`points` array. An optional `normals` array with the same shape is normalized and
+used directly; Open3D estimates normals when that array is absent. Coordinates
+are used as stored in `points`; `loc` and `scale` remain archive metadata.
+Both primitive families and both scan algorithms accept these inputs.
+
 The SuperFlex family follows [SuperFlex, Section 3 and Appendix A.1](https://arxiv.org/html/2607.01015):
 three semi-axes, two shape exponents, three rotation angles, three translations,
 two taper coefficients, and a curvature/plane-angle pair for each of the x, y,
@@ -24,7 +39,7 @@ The implicit function applies the inverse operations in reverse order.
 
 The scan entry point supports both GAIR-RANSAC and GC-RANSAC through its existing
 `ALGORITHM_NAME` selection. The family is propagated to hypotheses, graph-cut
-local refinements, and final refits for both PLY clouds and sampled STL meshes.
+local refinements, and final refits for PLY clouds, NPZ archives, and sampled STL meshes.
 `main_pc_import.py` also supports the family selection for LS, inner-RANSAC,
 RANSAC, GAIR-RANSAC, and GC-RANSAC. Residuals, transformed normals,
 interior scoring, meshes, surface coverage, and reconstruction evaluation all
