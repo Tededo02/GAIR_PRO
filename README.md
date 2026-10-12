@@ -2,7 +2,7 @@
 
 GAIR_PRO extends the original **GAIR-RANSAC** algorithm for decomposing 3D point clouds into superquadrics. The pipeline launched through [`main_scan_pc.py`](main_scan_pc.py) adds **GPU acceleration with Metal on Apple silicon**, support for **19-parameter deformable superquadrics**, and a scoring criterion that penalizes primitives enclosing other point-cloud structures.
 
-The optimized algorithm is **approximately 30× faster than the original GAIR-RANSAC**. This is an indicative speedup; runtime depends on the hardware, input cloud, and settings.
+The optimized algorithm is **approximately 20× faster than the original GAIR-RANSAC**. This is an indicative speedup; runtime depends on the hardware, input cloud, and settings.
 
 ## Decomposition pipeline
 
