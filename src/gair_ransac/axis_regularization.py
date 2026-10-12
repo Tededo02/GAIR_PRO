@@ -4,7 +4,7 @@ from src.superquadrics.superquadric_param import SuperQuadricParams
 from src.superquadrics.superquadric_residual import _rotation_matrix_and_derivatives
 
 
-DEFAULT_AXIS_PENALTY_WEIGHT = 0.4
+DEFAULT_AXIS_PENALTY_WEIGHT = 0.2
 
 
 def validate_axis_penalty_weight(weight: float) -> float:
@@ -57,6 +57,7 @@ def prefer_compact_model(
         return True
     if candidate_count != best_count or best is None:
         return False
+    # forse inutile perchè margine di 1 min_gain è davvero poco
     # A relative tolerance prevents equal-consensus local refinements from cycling on roundoff.
     candidate_size = candidate.a1**2 + candidate.a2**2 + candidate.a3**2
     best_size = best.a1**2 + best.a2**2 + best.a3**2

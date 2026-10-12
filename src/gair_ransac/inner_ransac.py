@@ -110,7 +110,8 @@ def _optimization_bounds(
         min_axis_length,
         global_max_axis_length,
     )
-    exponent_min, exponent_max = 0.06, 4.5
+    # Exponents above 2 produce concave, star-shaped superquadrics.
+    exponent_min, exponent_max = 0.06, 2.0
     angle_min, angle_max = -np.pi, np.pi
     translation_margin = 0.25 * reference_diagonal
 

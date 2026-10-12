@@ -17,28 +17,29 @@ from src.visualizations import plot as vis
 
 
 # Use a filename from test_objects/real or test_objects/model, or a repo-relative path.
-#PC_NAME = "car_pc_resized_100000.ply"
-PC_NAME = "sofa.npz"
+PC_NAME = "car_pc_resized_100000.ply"
+#PC_NAME = "lamp.ply"
 
 ALGORITHM_NAME = "gair"
-MODEL_FAMILY = "superflex"  # Options: "rigid" (11 parameters), "superflex" (19 parameters).
+MODEL_FAMILY = "rigid"  # Options: "rigid" (11 parameters), "superflex" (19 parameters).
 ROOT = Path(__file__).resolve().parent
 TEST_OBJECTS_DIR = ROOT / "test_objects"
 PC_DIR = TEST_OBJECTS_DIR / "real"
 MODEL_DIR = TEST_OBJECTS_DIR / "model"
 SUPPORTED_INPUT_EXTENSIONS = {".ply", ".stl", ".npz"}
 K_NEIGHBORS = 90
-THRESHOLD = 0.010 # if 0 use point spacing to compute effective threshold
+THRESHOLD = 0.015 # if 0 use point spacing to compute effective threshold
 THRESHOLD_SPACING_FACTOR = 2.0
 M_NEIGHBORS = 8
-MAX_MODELS = 10
+MAX_MODELS = 16
 MAX_ITERATIONS = 40
 INNER_ITERATIONS = 80
+OUTER_BATCH_SIZE = 16
 SAMPLE_SIZE = 30
 MIN_INLIERS = 200
 MIN_COVERAGE = 0.1
 MSS_MAX_POOL_FRACTION = 0.18
-RANDOM_SEED = 1234577
+RANDOM_SEED = 12345677
 MESH_SAMPLE_COUNT = 8000
 AXIS_PENALTY_WEIGHT = DEFAULT_AXIS_PENALTY_WEIGHT
 INTERIOR_PENALTY_WEIGHT = DEFAULT_INTERIOR_PENALTY_WEIGHT
@@ -192,6 +193,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--mesh-samples", type=int, default=MESH_SAMPLE_COUNT)
     parser.add_argument("--seed", type=int, default=RANDOM_SEED)
     parser.add_argument("--model-family", choices=MODEL_FAMILIES, default=MODEL_FAMILY)
+    parser.add_argument("--outer-batch-size", type=int, default=OUTER_BATCH_SIZE)
     parser.add_argument("--axis-penalty-weight", type=float, default=AXIS_PENALTY_WEIGHT)
     parser.add_argument("--interior-penalty-weight", type=float, default=INTERIOR_PENALTY_WEIGHT)
     return parser.parse_args(argv)
@@ -203,6 +205,8 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parse_args(argv)
     model_family = validate_model_family(args.model_family)
+    if args.outer_batch_size < 1:
+        raise ValueError("outer_batch_size must be a positive integer")
     if not np.isfinite(args.axis_penalty_weight) or args.axis_penalty_weight < 0.0:
         raise ValueError("axis_penalty_weight must be finite and non-negative")
     validate_interior_penalty_weight(args.interior_penalty_weight)
@@ -243,6 +247,8 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print("Running GC-RANSAC")
     print(f"Models | family={model_family} parameters={parameter_count(model_family)}")
+    if model_family == "superflex":
+        print(f"Outer hypotheses | rigid_warm_starts={args.outer_batch_size} superflex_variants={3 * args.outer_batch_size}")
     print(f"Excess-axis penalty | weight={args.axis_penalty_weight:g}")
     print(f"Coherent-interior penalty | weight={args.interior_penalty_weight:g}")
     models, inliers_masks, total_best_mss_used, total_local_opts = gair_ransac(
@@ -262,6 +268,7 @@ def main(argv: list[str] | None = None) -> int:
         axis_penalty_weight=args.axis_penalty_weight,
         interior_penalty_weight=args.interior_penalty_weight,
         model_family=model_family,
+        outer_batch_size=args.outer_batch_size,
     )
     if not models:
         raise RuntimeError("gair_ransac did not return any model")

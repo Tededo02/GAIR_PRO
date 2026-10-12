@@ -8,7 +8,7 @@ from .axis_regularization import prefer_compact_model
 from .initgraph import build_knn_graph
 
 
-DEFAULT_INTERIOR_PENALTY_WEIGHT = 25.0
+DEFAULT_INTERIOR_PENALTY_WEIGHT = 20.0
 SCORE_RELATIVE_TOLERANCE = 1e-6
 
 

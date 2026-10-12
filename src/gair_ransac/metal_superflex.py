@@ -71,16 +71,26 @@ def fit_superflex_hypothesis_batch(
     batch_size = len(points)
     if batch_size == 0:
         return MetalBatchFitResult(np.empty((0, 19)), np.empty((0, 3)))
+    lower = np.broadcast_to(np.asarray(lower, dtype=np.float64), (batch_size, 19))
+    upper = np.broadcast_to(np.asarray(upper, dtype=np.float64), (batch_size, 19))
+    loss_scale = np.broadcast_to(np.asarray(loss_scale, dtype=np.float64), (batch_size,))
+    diagonal = np.broadcast_to(np.asarray(diagonal, dtype=np.float64), (batch_size,))
+    support_box = np.broadcast_to(np.asarray(support_box, dtype=np.float64), (batch_size, 3, 3))
+    axis_penalty_weight = np.broadcast_to(np.asarray(axis_penalty_weight, dtype=np.float64), (batch_size,))
     warm = _gpu_fit(
-        points, initial_rigid_parameters, lower[:11], upper[:11], loss_scale, diagonal,
+        points, initial_rigid_parameters, lower[:, :11], upper[:, :11], loss_scale, diagonal,
         axis_penalty_weight=axis_penalty_weight, axis_support=support_box,
     )
     # Failed rigid warm starts retain PCA seeds; no optimization is retried on the CPU.
     rigid = np.where(warm.success[:, None], warm.parameters, initial_rigid_parameters)
     initial = superflex_axis_initializations(rigid)
+    # Each sample keeps its own bounds and scales across its three axis variants.
     extended = fit_superflex_metal_batch(
-        np.repeat(points, 3, axis=0), initial.reshape(-1, 19), lower, upper, loss_scale, diagonal,
-        axis_penalty_weight=axis_penalty_weight, axis_support=support_box,
+        np.repeat(points, 3, axis=0), initial.reshape(-1, 19),
+        np.repeat(lower, 3, axis=0), np.repeat(upper, 3, axis=0),
+        np.repeat(loss_scale, 3), np.repeat(diagonal, 3),
+        axis_penalty_weight=np.repeat(axis_penalty_weight, 3),
+        axis_support=np.repeat(support_box, 3, axis=0),
     )
     costs = np.where(extended.success, extended.diagnostics[:, 2], np.inf).reshape(batch_size, 3)
     winner = np.argmin(costs, axis=1)

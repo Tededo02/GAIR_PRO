@@ -79,6 +79,42 @@ def fit_deformable_superquadric_ls(
     return _unpack(result.parameters[0], diagonal)
 
 
+def fit_deformable_hypotheses_batch(
+    samples: np.ndarray,
+    axis_penalty_weight: float = DEFAULT_AXIS_PENALTY_WEIGHT,
+) -> list[DeformableSuperQuadricParams | None]:
+    from .inner_ransac import _pca_initial_parameters
+    from .metal_superflex import require_superflex_metal, superflex_optimization_bounds, fit_superflex_hypothesis_batch
+
+    require_superflex_metal()
+    axis_penalty_weight = validate_axis_penalty_weight(axis_penalty_weight)
+    samples = np.asarray(samples, dtype=np.float64)
+    if samples.ndim != 3 or samples.shape[2] != 3 or samples.shape[1] < 19:
+        raise ValueError("samples must have shape (B, N, 3) with at least 19 points per sample")
+    models: list[DeformableSuperQuadricParams | None] = [None] * len(samples)
+    indices, initial, bounds = [], [], []
+    for index, sample in enumerate(samples):
+        try:
+            sample_bounds = superflex_optimization_bounds(sample, axis_penalty_weight)
+            sample_initial = _pca_initial_parameters(sample[None])[0]
+        except (ValueError, FloatingPointError, np.linalg.LinAlgError):
+            continue
+        bounds.append(sample_bounds)
+        initial.append(sample_initial)
+        indices.append(index)
+    if not indices:
+        return models
+    lower, upper, loss_scale, diagonal, support = (np.stack(values) for values in zip(*bounds))
+    result = fit_superflex_hypothesis_batch(
+        samples[indices], np.stack(initial), lower, upper, loss_scale, diagonal,
+        support, axis_penalty_weight,
+    )
+    for index, parameters, scale, success in zip(indices, result.parameters, diagonal, result.success):
+        if success:
+            models[index] = _unpack(parameters, float(scale))
+    return models
+
+
 def _fit_deformable_cpu(points, bounds_reference_points, axis_penalty_weight, initial_model):
     from scipy.optimize import least_squares
     from .inner_ransac import _optimization_bounds, fit_superquadric_ls, pca_initialization

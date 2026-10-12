@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Iterator, Optional
 import time
 import numpy as np
 
@@ -94,6 +94,51 @@ def _sample_superquadric_surface(model: "SuperQuadricParams", n: int = 1000) -> 
     return (model.deform(pts) @ R.T) + model.t
 
 
+def _batched_superflex_outer_hypotheses(
+    points: FloatArray,
+    normals: FloatArray | None,
+    sampler_context: AdaptiveLocalFpsSamplerContext,
+    sample_size: int,
+    max_iterations: int,
+    rng: np.random.Generator,
+    batch_size: int,
+    axis_penalty_weight: float,
+    deadline: float | None,
+) -> Iterator[tuple[FloatArray, SuperQuadricParams | None]]:
+    from .deformable_fitting import fit_deformable_hypotheses_batch
+
+    iteration = 0
+    while iteration < max_iterations:
+        if deadline is not None and time.perf_counter() >= deadline:
+            return
+        samples = []
+        for _ in range(min(batch_size, max_iterations - iteration)):
+            if samples and deadline is not None and time.perf_counter() >= deadline:
+                break
+            samples.append(np.asarray(adaptive_local_fps_mss(
+                points, normals=normals, sample_size=sample_size,
+                initial_k=300, candidate_multiplier=12, rng=rng,
+                sampler_context=sampler_context,
+            ), dtype=np.float64))
+        models = fit_deformable_hypotheses_batch(np.stack(samples), axis_penalty_weight)
+        for offset, (sample, model) in enumerate(zip(samples, models)):
+            # Preserve the first completed candidate when a dispatch exceeds the deadline.
+            if offset and deadline is not None and time.perf_counter() >= deadline:
+                return
+            iteration += 1
+            yield sample, model
+
+
+def _next_local_seed(rng: np.random.Generator, used_seeds: set[int] | None) -> int:
+    while True:
+        seed = int(rng.integers(0, np.iinfo(np.int32).max))
+        if used_seeds is None:
+            return seed
+        if seed not in used_seeds:
+            used_seeds.add(seed)
+            return seed
+
+
 def gair_ransac(
     point_cloud: np.ndarray,
     normals: np.ndarray | None = None,
@@ -117,12 +162,15 @@ def gair_ransac(
     axis_penalty_weight: float = DEFAULT_AXIS_PENALTY_WEIGHT,
     interior_penalty_weight: float = DEFAULT_INTERIOR_PENALTY_WEIGHT,
     model_family: str = "rigid",
+    outer_batch_size: int = 1,
 ) -> tuple[list[SuperQuadricParams], list[BoolArray], FloatArray | None, int]:
     """deadline: an absolute time.perf_counter() value. When set, the per-model iteration
     loop, the graph-cut local-optimization loop, and the inner_ransac refinement step all
     stop immediately once it passes, returning whatever best result was found so far.
     None (default) preserves normal, iteration-count-bounded behavior for run.py."""
     validate_model_family(model_family)
+    if not isinstance(outer_batch_size, (int, np.integer)) or outer_batch_size < 1:
+        raise ValueError("outer_batch_size must be a positive integer")
     if sample_size < parameter_count(model_family):
         raise ValueError(f"sample_size must be at least {parameter_count(model_family)} for {model_family}")
     total_best_mss_used: FloatArray | None = None
@@ -142,7 +190,16 @@ def gair_ransac(
     mss_normals: FloatArray | None = np.asarray(normals, dtype=np.float64) if normals is not None else None
     normals: FloatArray = np.asarray(normals, dtype=np.float64) if normals is not None else np.zeros((point_cloud.shape[0], 3), dtype=np.float64)
 
-    rng = np.random.default_rng(random_seed)
+    if model_family == "superflex":
+        # Independent streams keep outer sampling unaffected by local searches.
+        sampling_seed = np.random.SeedSequence(random_seed)
+        rng = np.random.default_rng(sampling_seed)
+        refinement_rng = np.random.default_rng(sampling_seed.spawn(1)[0])
+        used_local_seeds: set[int] | None = set()
+    else:
+        rng = np.random.default_rng(random_seed)
+        refinement_rng = rng
+        used_local_seeds = None
     n_points: int = point_cloud.shape[0]
     remaining_indices: IntArray = np.arange(n_points, dtype=np.int64)
     full_neighbors, full_edge = build_knn_graph(
@@ -192,6 +249,7 @@ def gair_ransac(
         edge: IntArray = _induced_subgraph_edges(full_edge, remaining_indices, n_points)
         best_mss_used: FloatArray | None = None
         mss_sampler_context: AdaptiveLocalFpsSamplerContext | None = None
+        outer_hypotheses = None
 
         for j in range(max_iterations):
             if deadline is not None and time.perf_counter() >= deadline:
@@ -201,27 +259,40 @@ def gair_ransac(
                     current_point_cloud,
                     V_mss,
                 )
-            M_j = np.asarray(
-                adaptive_local_fps_mss(
-                    current_point_cloud,
-                    normals=V_mss,
-                    sample_size=sample_size,
-                    initial_k=300,
-                    candidate_multiplier=12,
-                    rng=rng,
-                    sampler_context=mss_sampler_context,
-                ),
-                dtype=np.float64,
-            )
-            try:
-                H_j: SuperQuadricParams = fit_superquadric_ls(
-                    M_j, error_metric=error_metric, axis_penalty_weight=axis_penalty_weight,
-                    model_family=model_family,
+            if model_family == "superflex" and outer_batch_size > 1:
+                if outer_hypotheses is None:
+                    outer_hypotheses = _batched_superflex_outer_hypotheses(
+                        current_point_cloud, V_mss, mss_sampler_context, sample_size,
+                        max_iterations, rng, outer_batch_size, axis_penalty_weight, deadline,
+                    )
+                try:
+                    M_j, H_j = next(outer_hypotheses)
+                except StopIteration:
+                    break
+                if H_j is None:
+                    continue
+            else:
+                M_j = np.asarray(
+                    adaptive_local_fps_mss(
+                        current_point_cloud,
+                        normals=V_mss,
+                        sample_size=sample_size,
+                        initial_k=300,
+                        candidate_multiplier=12,
+                        rng=rng,
+                        sampler_context=mss_sampler_context,
+                    ),
+                    dtype=np.float64,
                 )
-            except SuperflexMetalError:
-                raise
-            except Exception:
-                continue
+                try:
+                    H_j = fit_superquadric_ls(
+                        M_j, error_metric=error_metric, axis_penalty_weight=axis_penalty_weight,
+                        model_family=model_family,
+                    )
+                except SuperflexMetalError:
+                    raise
+                except Exception:
+                    continue
 
             candidate_inliers, candidate_count, candidate_score, _ = evaluate_model_consensus(
                 H_j, current_point_cloud, threshold, consensus_metric, V if use_normal_coherence else None,
@@ -274,7 +345,7 @@ def gair_ransac(
                     error_metric=error_metric,
                     consensus_metric=consensus_metric,
                     n_iters=inner_iterations,
-                    random_seed=int(rng.integers(0, np.iinfo(np.int32).max)),
+                    random_seed=_next_local_seed(refinement_rng, used_local_seeds),
                     deadline=deadline,
                     consensus_context=consensus_context,
                     axis_penalty_weight=axis_penalty_weight,
@@ -385,7 +456,7 @@ def gair_ransac(
             best_model,
             current_point_cloud,
             threshold,
-            factor=2.0,
+            factor=3.0,
             error_metric=consensus_metric,
             normals=None
         )
